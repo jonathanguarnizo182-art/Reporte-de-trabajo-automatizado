@@ -1,0 +1,13 @@
+.reporting_assistant/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+*.spec
+.venv/
+venv/
+env/
+*.wav
+*.log
