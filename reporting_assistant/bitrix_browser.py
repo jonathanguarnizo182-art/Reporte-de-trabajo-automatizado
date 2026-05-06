@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -24,13 +25,21 @@ class BitrixBrowserAutomation:
         page.goto(url, wait_until="domcontentloaded")
         page.bring_to_front()
 
-    def send_time_entries(self, entries: list[BitrixTimeEntry]) -> None:
+    def send_time_entries(
+        self,
+        entries: list[BitrixTimeEntry],
+        progress_callback: Callable[[int, int, BitrixTimeEntry], None] | None = None,
+    ) -> None:
         if not entries:
             raise BitrixBrowserError("No hay entradas seleccionadas para enviar a Bitrix.")
+        self._validate_entries(entries)
         page = self._active_page()
         self._ensure_task_page(page)
         self._ensure_time_tracking_modal(page)
-        for entry in entries:
+        total = len(entries)
+        for index, entry in enumerate(entries, start=1):
+            if progress_callback is not None:
+                progress_callback(index, total, entry)
             self._add_time_entry(page, entry)
 
     def close(self) -> None:
@@ -103,11 +112,23 @@ class BitrixBrowserAutomation:
         )
 
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
+        self._discard_open_entry_form(page)
         self._click_add_entry(page)
         date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
         self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
         self._click_confirm_entry(page)
         self._wait_until_entry_saved(page, entry)
+
+    def _validate_entries(self, entries: list[BitrixTimeEntry]) -> None:
+        for entry in entries:
+            if not entry.target_date or not entry.start.strip() or not entry.comment.strip():
+                raise BitrixBrowserError("Hay entradas incompletas en el reporte seleccionado.")
+            if entry.hours < 0 or entry.minutes < 0 or entry.minutes >= 60:
+                label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
+                raise BitrixBrowserError(f"La duracion de {label} no es valida: {entry.duration_text}.")
+            if entry.hours == 0 and entry.minutes == 0:
+                label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
+                raise BitrixBrowserError(f"La duracion de {label} esta en cero.")
 
     def _click_add_entry(self, page) -> None:
         if self._entry_form_is_open(page):
@@ -164,10 +185,11 @@ class BitrixBrowserAutomation:
             if date_input is None or hours_input is None or minutes_input is None:
                 self._save_debug_artifacts(page)
                 raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el formulario activo.")
-            self._replace_input_value(date_input, date_text)
-            self._replace_input_value(hours_input, str(hours))
-            self._replace_input_value(minutes_input, str(minutes))
+            self._replace_input_value(date_input, date_text, self._date_time_pattern(date_text))
+            self._replace_input_value(hours_input, str(hours), rf"\b{hours}\b")
+            self._replace_input_value(minutes_input, str(minutes), rf"\b{minutes}\b")
             comment.fill(comment_text)
+            self._assert_comment_value(comment, comment_text)
         except BitrixBrowserError:
             raise
         except Exception as exc:
@@ -243,12 +265,62 @@ class BitrixBrowserAutomation:
                 continue
         return None
 
-    def _replace_input_value(self, input_locator, value: str) -> None:
+    def _date_time_pattern(self, value: str) -> str:
+        match = re.fullmatch(r"(\d{2}/\d{2}/\d{4})\s+0?(\d{1,2}):(\d{2})", value.strip())
+        if not match:
+            return re.escape(value.strip())
+        day, hour, minute = match.groups()
+        return rf"{re.escape(day)}\s+0?{int(hour)}:{re.escape(minute)}"
+
+    def _replace_input_value(self, input_locator, value: str, expected_pattern: str | None = None) -> None:
         input_locator.click()
         input_locator.press("Control+A")
-        input_locator.type(value)
+        input_locator.press("Backspace")
+        input_locator.type(value, delay=10)
+        input_locator.evaluate(
+            """(element) => {
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new Event('blur', { bubbles: true }));
+            }"""
+        )
+        input_locator.press("Tab")
+        if expected_pattern is None:
+            return
+        regex = re.compile(expected_pattern)
+        current = ""
+        for _ in range(10):
+            current = input_locator.input_value(timeout=500)
+            if regex.search(current):
+                return
+            input_locator.page.wait_for_timeout(100)
+        input_locator.evaluate(
+            """(element, nextValue) => {
+                element.value = nextValue;
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new Event('blur', { bubbles: true }));
+            }""",
+            value,
+        )
+        input_locator.press("Tab")
+        for _ in range(10):
+            current = input_locator.input_value(timeout=500)
+            if regex.search(current):
+                return
+            input_locator.page.wait_for_timeout(100)
+        raise BitrixBrowserError(f"Bitrix no acepto el valor '{value}'. Valor visible actual: '{current}'.")
 
-    def _click_confirm_entry(self, page) -> None:
+    def _assert_comment_value(self, comment_locator, expected: str) -> None:
+        current = ""
+        for _ in range(10):
+            current = comment_locator.input_value(timeout=500)
+            if current.strip() == expected.strip():
+                return
+            comment_locator.page.wait_for_timeout(100)
+        raise BitrixBrowserError("Bitrix no acepto el comentario completo en el formulario activo.")
+
+    def _click_confirm_entry_legacy(self, page) -> None:
         comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
         container = self._entry_form_container(comment)
         buttons = container.locator("button:visible, [role='button']:visible")
@@ -264,13 +336,68 @@ class BitrixBrowserAutomation:
                 continue
         page.keyboard.press("Control+Enter")
 
-    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry) -> None:
+    def _wait_until_entry_saved_legacy(self, page, entry: BitrixTimeEntry) -> None:
         expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
         try:
             page.get_by_text(expected_date, exact=False).first.wait_for(state="visible", timeout=6000)
             return
         except Exception:
             page.wait_for_timeout(1000)
+
+    def _click_confirm_entry(self, page) -> None:
+        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
+        container = self._entry_form_container(comment)
+        if self._click_check_button(container.locator("button:visible")):
+            return
+        if self._click_check_button(page.locator("button:visible")):
+            return
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("No pude pulsar el chulo azul para guardar la entrada de tiempo.")
+
+    def _click_check_button(self, buttons) -> bool:
+        for index in range(buttons.count()):
+            button = buttons.nth(index)
+            try:
+                label = " ".join((button.inner_text(timeout=300) or "").split())
+                class_name = button.get_attribute("class", timeout=300) or ""
+                icon = button.locator(".ui-icon-set").first
+                icon_class = icon.get_attribute("class", timeout=300) if icon.count() else ""
+                is_check_icon = "--check" in (icon_class or "")
+                is_filled_icon_button = "--style-filled" in class_name and "--with-icon" in class_name
+                if is_check_icon or (label in {"", "✓"} and is_filled_icon_button):
+                    button.click()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry) -> None:
+        expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
+        expected_duration = f"{entry.hours:02d}:{entry.minutes:02d}:00"
+        try:
+            page.locator(".tasks-time-tracking-list-item-edit").wait_for(state="detached", timeout=8000)
+            page.get_by_text(expected_date, exact=False).first.wait_for(state="visible", timeout=6000)
+            page.get_by_text(expected_duration, exact=False).first.wait_for(state="visible", timeout=6000)
+            return
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(
+                f"No pude confirmar que Bitrix guardara la entrada {expected_date} ({expected_duration})."
+            ) from exc
+
+    def _discard_open_entry_form(self, page) -> None:
+        forms = page.locator(".tasks-time-tracking-list-item-edit")
+        if forms.count() == 0:
+            return
+        form = forms.first
+        try:
+            close_icon = form.locator(".tasks-time-tracking-list-item-edit-close-icon").first
+            if close_icon.is_visible(timeout=500):
+                close_icon.click()
+                form.wait_for(state="detached", timeout=3000)
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError("Hay un formulario de Bitrix abierto que no se pudo cancelar antes de continuar.") from exc
 
     def _save_debug_artifacts(self, page) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

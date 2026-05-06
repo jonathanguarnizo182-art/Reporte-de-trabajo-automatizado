@@ -934,7 +934,7 @@ class ReportAutomationApp:
 
         self._set_bitrix_busy(True, f"Enviando {len(dialog.result)} entradas a Bitrix...")
         try:
-            self.bitrix_browser.send_time_entries(dialog.result)
+            self.bitrix_browser.send_time_entries(dialog.result, progress_callback=self._update_bitrix_progress)
             self.status_var.set(f"Entradas enviadas a Bitrix: {len(dialog.result)}.")
             messagebox.showinfo("Bitrix actualizado", f"Se enviaron {len(dialog.result)} entradas a Seguimiento del tiempo.")
         except BitrixBrowserError as exc:
@@ -953,6 +953,12 @@ class ReportAutomationApp:
             self.bitrix_send_button.configure(state="disabled" if busy else "normal")
         if status:
             self.status_var.set(status)
+
+    def _update_bitrix_progress(self, index: int, total: int, entry: BitrixTimeEntry) -> None:
+        self.status_var.set(
+            f"Enviando {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
+        )
+        self.root.update_idletasks()
 
     def _create_new_report(self) -> None:
         if self.word_service is None:
