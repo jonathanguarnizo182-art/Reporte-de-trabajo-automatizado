@@ -147,11 +147,21 @@ class BitrixBrowserAutomation:
         try:
             comment.wait_for(state="visible", timeout=3000)
             container = self._entry_form_container(comment)
-            editable_inputs = self._editable_inputs(container)
-            date_input = self._find_input_by_value(editable_inputs, r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}")
-            hours_input = self._find_input_by_value(editable_inputs, r"\d+\s*h")
-            minutes_input = self._find_input_by_value(editable_inputs, r"\d+\s*min")
-            if not date_input or not hours_input or not minutes_input:
+            date_input, hours_input, minutes_input = self._time_entry_inputs(container)
+            if date_input is None or hours_input is None or minutes_input is None:
+                editable_inputs = self._editable_inputs(container)
+                date_input = self._find_input_by_value(editable_inputs, r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}")
+                hours_input = self._find_input_by_value(editable_inputs, r"\d+\s*h")
+                minutes_input = self._find_input_by_value(editable_inputs, r"\d+\s*min")
+            if date_input is None or hours_input is None or minutes_input is None:
+                page_inputs = self._editable_inputs(page)
+                if date_input is None:
+                    date_input = self._find_input_by_label(page_inputs, "Fecha")
+                if hours_input is None:
+                    hours_input = self._find_input_by_label(page_inputs, "Horas:")
+                if minutes_input is None:
+                    minutes_input = self._find_input_by_label(page_inputs, "Minutos:")
+            if date_input is None or hours_input is None or minutes_input is None:
                 self._save_debug_artifacts(page)
                 raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el formulario activo.")
             self._replace_input_value(date_input, date_text)
@@ -166,6 +176,31 @@ class BitrixBrowserAutomation:
 
     def _entry_form_container(self, comment):
         return comment.locator("xpath=ancestor::*[.//input][1]")
+
+    def _time_entry_inputs(self, container):
+        date_input = self._first_visible_enabled(
+            container.locator(".tasks-time-tracking-list-item-edit-time-calendar input")
+        )
+        time_inputs = container.locator(".tasks-time-tracking-list-item-edit-time-field input")
+        hours_input = self._nth_visible_enabled(time_inputs, 0)
+        minutes_input = self._nth_visible_enabled(time_inputs, 1)
+        return date_input, hours_input, minutes_input
+
+    def _first_visible_enabled(self, locator):
+        return self._nth_visible_enabled(locator, 0)
+
+    def _nth_visible_enabled(self, locator, visible_index: int):
+        seen = 0
+        for index in range(locator.count()):
+            item = locator.nth(index)
+            try:
+                if item.is_visible(timeout=300) and item.is_enabled(timeout=300):
+                    if seen == visible_index:
+                        return item
+                    seen += 1
+            except Exception:
+                continue
+        return None
 
     def _editable_inputs(self, container):
         inputs = container.locator("input:visible")
@@ -190,6 +225,20 @@ class BitrixBrowserAutomation:
             try:
                 if regex.search(item.input_value(timeout=300)):
                     return item
+            except Exception:
+                continue
+        return None
+
+    def _find_input_by_label(self, inputs: list, label_text: str):
+        for item in inputs:
+            try:
+                label = item.locator(
+                    "xpath=ancestor::*[contains(@class, 'ui-system-input')][1]/*[contains(@class, 'ui-system-input-label')]"
+                )
+                if label.first.is_visible(timeout=300):
+                    text = " ".join(label.first.inner_text(timeout=300).split())
+                    if text.lower() == label_text.lower():
+                        return item
             except Exception:
                 continue
         return None
