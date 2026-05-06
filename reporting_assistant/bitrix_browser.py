@@ -143,6 +143,12 @@ class BitrixBrowserAutomation:
         for index in range(inputs.count()):
             item = inputs.nth(index)
             try:
+                input_type = (item.get_attribute("type", timeout=300) or "").lower()
+                if input_type in {"checkbox", "radio", "hidden"}:
+                    continue
+            except Exception:
+                pass
+            try:
                 value = item.input_value(timeout=500)
             except Exception:
                 value = ""
@@ -150,8 +156,6 @@ class BitrixBrowserAutomation:
                 matches.append(item)
         if len(matches) >= 3:
             return matches[-3:]
-        if inputs.count() >= 3:
-            return [inputs.nth(inputs.count() - 3), inputs.nth(inputs.count() - 2), inputs.nth(inputs.count() - 1)]
         raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el modal de Bitrix.")
 
     def _click_confirm_entry(self, page) -> None:
