@@ -186,8 +186,8 @@ class BitrixBrowserAutomation:
                 self._save_debug_artifacts(page)
                 raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el formulario activo.")
             self._replace_input_value(date_input, date_text, self._date_time_pattern(date_text))
-            self._replace_input_value(hours_input, str(hours), rf"\b{hours}\b")
-            self._replace_input_value(minutes_input, str(minutes), rf"\b{minutes}\b")
+            self._replace_input_value(hours_input, str(hours), self._numeric_time_pattern(hours))
+            self._replace_input_value(minutes_input, str(minutes), self._numeric_time_pattern(minutes))
             comment.fill(comment_text)
             self._assert_comment_value(comment, comment_text)
         except BitrixBrowserError:
@@ -271,6 +271,11 @@ class BitrixBrowserAutomation:
             return re.escape(value.strip())
         day, hour, minute = match.groups()
         return rf"{re.escape(day)}\s+0?{int(hour)}:{re.escape(minute)}"
+
+    def _numeric_time_pattern(self, value: int) -> str:
+        if value == 0:
+            return r"^$|\b0\b"
+        return rf"\b{value}\b"
 
     def _replace_input_value(self, input_locator, value: str, expected_pattern: str | None = None) -> None:
         input_locator.click()
