@@ -114,10 +114,28 @@ class BitrixBrowserAutomation:
         page.wait_for_timeout(700)
 
     def _click_add_entry(self, page) -> None:
+        if self._entry_form_is_open(page):
+            return
         button = page.get_by_text("Agregar entrada", exact=True)
-        if button.first.is_visible(timeout=1500):
-            button.first.click()
-            page.wait_for_timeout(300)
+        try:
+            target = button.first
+            if target.is_visible(timeout=1500) and target.is_enabled(timeout=500):
+                target.click()
+                page.wait_for_timeout(300)
+                return
+        except Exception:
+            pass
+        if self._entry_form_is_open(page):
+            return
+        raise BitrixBrowserError(
+            "El boton Agregar entrada no esta disponible. Abra el formulario de entrada en Seguimiento del tiempo y vuelva a intentar."
+        )
+
+    def _entry_form_is_open(self, page) -> bool:
+        try:
+            return page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.is_visible(timeout=500)
+        except Exception:
+            return False
 
     def _entry_inputs(self, page):
         inputs = page.locator("input:visible")
