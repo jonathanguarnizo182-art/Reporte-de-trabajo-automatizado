@@ -1,8 +1,14 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
-from .gui import launch_app
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from reporting_assistant.gui import launch_app
+else:
+    from .gui import launch_app
 
 
 def main() -> None:
@@ -14,4 +20,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

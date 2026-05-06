@@ -14,6 +14,13 @@ class TimeSegment:
 
 
 @dataclass(slots=True)
+class ClientProject:
+    name: str
+    root_path: Path
+    reports_dir: Path
+
+
+@dataclass(slots=True)
 class ReportTemplate:
     report_id: str
     family_name: str
@@ -25,12 +32,23 @@ class ReportTemplate:
 
 
 @dataclass(slots=True)
+class NewReportMetadata:
+    company: str
+    project_code: str
+    function: str
+    reporter: str
+    city: str
+    received_by: str = ""
+
+
+@dataclass(slots=True)
 class GeneratedEntry:
     title: str
     summary: str
     numbered_sections: list[str]
     full_text: str
     raw_model_response: str = ""
+    bold_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -46,4 +64,3 @@ class WorkdayPayload:
     update_mode: str = "replace"
     existing_text: str = ""
     context: dict[str, str] = field(default_factory=dict)
-

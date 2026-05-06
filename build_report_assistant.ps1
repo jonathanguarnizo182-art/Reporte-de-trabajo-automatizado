@@ -8,8 +8,7 @@ Set-Location -Path $PSScriptRoot
 & $Python -m PyInstaller `
     --noconfirm `
     --windowed `
-    --name ReporteServiciosAI `
+    --name ReporteServicios `
     --collect-all holidays `
     --hidden-import win32timezone `
     launch_report_assistant.pyw
-
