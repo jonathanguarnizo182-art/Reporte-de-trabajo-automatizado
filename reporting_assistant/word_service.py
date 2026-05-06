@@ -13,7 +13,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from .calendar_utils import calculate_effective_hours, default_schedule_for_day, month_last_day
 from .catalog import ResolvedDocument
-from .models import GeneratedEntry, NewReportMetadata, TimeSegment
+from .models import BitrixTimeEntry, GeneratedEntry, NewReportMetadata, TimeSegment
 
 try:
     import pythoncom  # type: ignore
@@ -97,6 +97,37 @@ class WordReportService:
     def entry_exists(self, path: Path, target_date: date) -> tuple[bool, str]:
         return self._entry_exists_direct(path, target_date)
 
+    def list_bitrix_time_entries(self, path: Path) -> list[BitrixTimeEntry]:
+        root = self._read_document_xml(path)
+        entries: list[BitrixTimeEntry] = []
+        for table in self._daily_tables_xml(root):
+            body = self._xml_cell_text(table, 3, 1).strip()
+            if not body:
+                continue
+            raw_date = self._xml_cell_text(table, 1, 2).strip()
+            try:
+                target_date = datetime.strptime(raw_date, "%d/%m/%Y").date()
+            except ValueError:
+                continue
+            starts = [value.strip() for value in self._xml_cell_text(table, 1, 4).splitlines() if value.strip()]
+            effective_values = [value.strip() for value in self._xml_cell_text(table, 1, 8).splitlines() if value.strip()]
+            for index, effective in enumerate(effective_values):
+                duration = self._parse_effective_duration(effective)
+                if duration is None:
+                    continue
+                start = starts[index] if index < len(starts) else starts[0] if starts else "08:00"
+                entries.append(
+                    BitrixTimeEntry(
+                        target_date=target_date,
+                        start=start,
+                        hours=duration[0],
+                        minutes=duration[1],
+                        comment=body,
+                        source_label=f"{raw_date} {start}",
+                    )
+                )
+        return entries
+
     def write_day_block(
         self,
         path: Path,
@@ -114,6 +145,19 @@ class WordReportService:
             if self._xml_cell_text(table, 1, 2) == target:
                 return True, self._xml_cell_text(table, 3, 1)
         return False, ""
+
+    def _parse_effective_duration(self, value: str) -> tuple[int, int] | None:
+        match = re.search(r"(\d{1,3})\s*:\s*(\d{2})", value)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        hours_match = re.search(r"(\d{1,3})\s*h", value, flags=re.IGNORECASE)
+        minutes_match = re.search(r"(\d{1,3})\s*m", value, flags=re.IGNORECASE)
+        if hours_match or minutes_match:
+            return (
+                int(hours_match.group(1)) if hours_match else 0,
+                int(minutes_match.group(1)) if minutes_match else 0,
+            )
+        return None
 
     def _write_day_block_direct(
         self,

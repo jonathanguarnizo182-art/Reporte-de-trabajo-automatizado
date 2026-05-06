@@ -7,7 +7,7 @@ import re
 from html.parser import HTMLParser
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, Button, BooleanVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
+from tkinter import BOTH, END, LEFT, MULTIPLE, RIGHT, Button, BooleanVar, Listbox, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
 import tkinter.font as tkfont
 
 try:
@@ -17,8 +17,9 @@ except ImportError:  # pragma: no cover
 
 from .calendar_utils import SPANISH_MONTHS, calculate_effective_hours, classify_day, default_schedule_for_day
 from .catalog import ClientCatalog, ReportCatalog, normalize_name, extract_report_metadata
+from .bitrix_browser import BitrixBrowserAutomation, BitrixBrowserError
 from .config import AppConfig, load_config, save_config
-from .models import ClientProject, GeneratedEntry, NewReportMetadata, ReportTemplate, TimeSegment, WorkdayPayload
+from .models import BitrixTimeEntry, ClientProject, GeneratedEntry, NewReportMetadata, ReportTemplate, TimeSegment, WorkdayPayload
 from .scheduler import install_tasks
 from .word_service import WordReportService, WordUnavailableError
 
@@ -169,6 +170,46 @@ class UpdateModeDialog(Toplevel):
 
     def _close(self, result: str) -> None:
         self.result = result
+        self.destroy()
+
+
+class BitrixEntriesDialog(Toplevel):
+    def __init__(self, parent, entries: list[BitrixTimeEntry]):
+        super().__init__(parent)
+        self.title("Enviar a Bitrix")
+        self.result: list[BitrixTimeEntry] | None = None
+        self.entries = entries
+        self.geometry("900x420")
+        self.transient(parent)
+        self.grab_set()
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=BOTH, expand=True)
+        ttk.Label(container, text="Revise las entradas que se enviaran a Seguimiento del tiempo.").pack(anchor="w")
+
+        list_frame = ttk.Frame(container)
+        list_frame.pack(fill=BOTH, expand=True, pady=(8, 8))
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        self.listbox = Listbox(list_frame, selectmode=MULTIPLE, height=14, yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=self.listbox.yview)
+        self.listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill="y")
+
+        for entry in entries:
+            preview = " ".join(entry.comment.split())[:110]
+            self.listbox.insert(
+                END,
+                f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start} | {entry.duration_text} | {preview}",
+            )
+        self.listbox.select_set(0, END)
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Enviar seleccionadas", command=self._accept).pack(side=LEFT)
+        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side=LEFT, padx=8)
+
+    def _accept(self) -> None:
+        self.result = [self.entries[index] for index in self.listbox.curselection()]
         self.destroy()
 
 
@@ -518,15 +559,26 @@ class ReportAutomationApp:
         self.status_var = StringVar(value="Seleccione cliente, reporte y escriba el avance.")
         self.business_day_var = StringVar(value="")
         self.save_button = None
+        self.bitrix_send_button = None
+        self.bitrix_browser = BitrixBrowserAutomation()
         self._save_in_progress = False
+        self._bitrix_in_progress = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_clients(select_default=True)
         self._apply_date_defaults()
         if auto_open:
             self.root.lift()
             self.root.attributes("-topmost", True)
             self.root.after(1500, lambda: self.root.attributes("-topmost", False))
+
+    def _on_close(self) -> None:
+        try:
+            self.bitrix_browser.close()
+        except Exception:
+            LOGGER.exception("No se pudo cerrar el navegador controlado.")
+        self.root.destroy()
 
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, padding=12)
@@ -588,6 +640,9 @@ class ReportAutomationApp:
         ttk.Button(toolbar, text="Limpiar", command=lambda: self.notes_widget.delete("1.0", END)).pack(side=LEFT, padx=8)
         ttk.Button(toolbar, text="Copiar", command=self._copy_text).pack(side=LEFT)
         ttk.Button(toolbar, text="Ver", command=lambda: self._load_current_day_entry(show_errors=True)).pack(side=LEFT, padx=8)
+        ttk.Button(toolbar, text="Abrir Bitrix", command=self._open_bitrix_browser).pack(side=LEFT, padx=(18, 8))
+        self.bitrix_send_button = ttk.Button(toolbar, text="Enviar a Bitrix", command=self._send_report_to_bitrix)
+        self.bitrix_send_button.pack(side=LEFT)
         self.notes_widget = Text(text_frame, wrap="word")
         self._configure_notes_formatting()
         self.notes_widget.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
@@ -843,6 +898,59 @@ class ReportAutomationApp:
         self._save_in_progress = busy
         if self.save_button is not None:
             self.save_button.configure(state="disabled" if busy else "normal")
+        if status:
+            self.status_var.set(status)
+
+    def _open_bitrix_browser(self) -> None:
+        try:
+            self.bitrix_browser.open_browser()
+            self.status_var.set("Chrome de Bitrix abierto. Abra manualmente la tarea correcta.")
+        except Exception as exc:
+            LOGGER.exception("Error abriendo Bitrix: %s", exc)
+            messagebox.showerror("Error al abrir Bitrix", str(exc))
+
+    def _send_report_to_bitrix(self) -> None:
+        if self._bitrix_in_progress:
+            return
+        if self.word_service is None:
+            messagebox.showerror("Word no disponible", "Instale pywin32 para leer el reporte.")
+            return
+        try:
+            report = self._selected_report()
+            entries = self.word_service.list_bitrix_time_entries(report.template_path)
+        except Exception as exc:
+            LOGGER.exception("Error leyendo entradas para Bitrix: %s", exc)
+            messagebox.showerror("Error al leer reporte", str(exc))
+            return
+        if not entries:
+            messagebox.showinfo("Sin entradas", "El reporte seleccionado no tiene actividades diligenciadas para enviar.")
+            return
+
+        dialog = BitrixEntriesDialog(self.root, entries)
+        self.root.wait_window(dialog)
+        if not dialog.result:
+            self.status_var.set("Envio a Bitrix cancelado.")
+            return
+
+        self._set_bitrix_busy(True, f"Enviando {len(dialog.result)} entradas a Bitrix...")
+        try:
+            self.bitrix_browser.send_time_entries(dialog.result)
+            self.status_var.set(f"Entradas enviadas a Bitrix: {len(dialog.result)}.")
+            messagebox.showinfo("Bitrix actualizado", f"Se enviaron {len(dialog.result)} entradas a Seguimiento del tiempo.")
+        except BitrixBrowserError as exc:
+            self.status_var.set("No fue posible enviar a Bitrix.")
+            messagebox.showerror("Error en Bitrix", str(exc))
+        except Exception as exc:
+            LOGGER.exception("Error enviando a Bitrix: %s", exc)
+            self.status_var.set("No fue posible enviar a Bitrix.")
+            messagebox.showerror("Error en Bitrix", str(exc))
+        finally:
+            self._set_bitrix_busy(False)
+
+    def _set_bitrix_busy(self, busy: bool, status: str | None = None) -> None:
+        self._bitrix_in_progress = busy
+        if self.bitrix_send_button is not None:
+            self.bitrix_send_button.configure(state="disabled" if busy else "normal")
         if status:
             self.status_var.set(status)
 

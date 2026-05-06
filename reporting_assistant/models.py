@@ -14,6 +14,20 @@ class TimeSegment:
 
 
 @dataclass(slots=True)
+class BitrixTimeEntry:
+    target_date: date
+    start: str
+    hours: int
+    minutes: int
+    comment: str
+    source_label: str = ""
+
+    @property
+    def duration_text(self) -> str:
+        return f"{self.hours:02d}:{self.minutes:02d}"
+
+
+@dataclass(slots=True)
 class ClientProject:
     name: str
     root_path: Path

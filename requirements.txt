@@ -1,3 +1,4 @@
 pywin32>=310
 holidays>=0.73
 pyinstaller>=6.14.0
+playwright>=1.52.0
