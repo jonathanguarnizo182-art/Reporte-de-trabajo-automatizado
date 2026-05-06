@@ -113,11 +113,77 @@ class BitrixBrowserAutomation:
 
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
         self._discard_open_entry_form(page)
-        self._click_add_entry(page)
-        date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
-        self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
-        self._click_confirm_entry(page)
-        self._wait_until_entry_saved(page, entry)
+        saved_id = self._add_time_entry_via_bitrix_service(page, entry)
+        self._wait_until_entry_saved(page, entry, saved_id)
+
+    def _add_time_entry_via_bitrix_service(self, page, entry: BitrixTimeEntry) -> str:
+        task_id = self._task_id_from_url(page.url)
+        hours, minutes = self._parse_start_time(entry.start)
+        payload = {
+            "year": entry.target_date.year,
+            "month": entry.target_date.month,
+            "day": entry.target_date.day,
+            "hour": hours,
+            "minute": minutes,
+            "seconds": entry.hours * 3600 + entry.minutes * 60,
+            "text": entry.comment,
+        }
+        try:
+            result = page.evaluate(
+                """async ({ taskId, entry }) => {
+                    const service = window.BX?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
+                    const text = window.BX?.Text;
+                    const timezone = window.BX?.Main?.timezone;
+                    if (!service) {
+                        return { ok: false, error: 'Bitrix no expuso timeTrackingService en esta pagina.' };
+                    }
+                    const localTarget = new Date(entry.year, entry.month - 1, entry.day, entry.hour, entry.minute, 0, 0);
+                    let createdAtMs = localTarget.getTime();
+                    if (timezone?.getOffset) {
+                        createdAtMs = localTarget.getTime() - timezone.getOffset(localTarget.getTime());
+                        createdAtMs = localTarget.getTime() - timezone.getOffset(createdAtMs);
+                    }
+                    const item = {
+                        id: text?.getRandom ? text.getRandom() : `codex-${Date.now()}-${Math.random()}`,
+                        taskId,
+                        createdAtTs: Math.floor(createdAtMs / 1000),
+                        seconds: entry.seconds,
+                        text: entry.text,
+                        source: 'manual',
+                        rights: { edit: true, remove: true },
+                    };
+                    const id = await service.add(taskId, item);
+                    if (id && service.list) {
+                        await service.list(taskId, { reset: true });
+                    }
+                    return { ok: Boolean(id), id: String(id), createdAtTs: item.createdAtTs };
+                }""",
+                {"taskId": task_id, "entry": payload},
+            )
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude enviar la entrada por el servicio interno de Bitrix: {exc}") from exc
+        if not result or not result.get("ok"):
+            self._save_debug_artifacts(page)
+            error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
+            raise BitrixBrowserError(f"Bitrix no acepto la entrada de tiempo por API interna: {error}")
+        return str(result["id"])
+
+    def _task_id_from_url(self, url: str) -> int:
+        match = re.search(r"/tasks/task/view/(\d+)/", url)
+        if not match:
+            raise BitrixBrowserError("No pude detectar el ID de la tarea en la URL de Bitrix.")
+        return int(match.group(1))
+
+    def _parse_start_time(self, value: str) -> tuple[int, int]:
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+        if not match:
+            raise BitrixBrowserError(f"La hora de inicio no es valida para Bitrix: {value}.")
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        if hours > 23 or minutes > 59:
+            raise BitrixBrowserError(f"La hora de inicio no es valida para Bitrix: {value}.")
+        return hours, minutes
 
     def _validate_entries(self, entries: list[BitrixTimeEntry]) -> None:
         for entry in entries:
@@ -376,7 +442,7 @@ class BitrixBrowserAutomation:
                 continue
         return False
 
-    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry) -> None:
+    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry, saved_id: str | None = None) -> None:
         expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
         expected_duration = f"{entry.hours:02d}:{entry.minutes:02d}:00"
         try:
@@ -385,10 +451,28 @@ class BitrixBrowserAutomation:
             page.get_by_text(expected_duration, exact=False).first.wait_for(state="visible", timeout=6000)
             return
         except Exception as exc:
+            if saved_id and self._entry_exists_in_bitrix_store(page, saved_id):
+                return
             self._save_debug_artifacts(page)
             raise BitrixBrowserError(
                 f"No pude confirmar que Bitrix guardara la entrada {expected_date} ({expected_duration})."
             ) from exc
+
+    def _entry_exists_in_bitrix_store(self, page, saved_id: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """(id) => {
+                        const store = window.BX?.Tasks?.V2?.Core?.getStore?.();
+                        const model = window.BX?.Tasks?.V2?.Const?.Model?.ElapsedTimes;
+                        const getter = model ? store?.getters?.[`${model}/getById`] : null;
+                        return Boolean(getter?.(id) || getter?.(Number(id)));
+                    }""",
+                    str(saved_id),
+                )
+            )
+        except Exception:
+            return False
 
     def _discard_open_entry_form(self, page) -> None:
         forms = page.locator(".tasks-time-tracking-list-item-edit")
