@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 from .config import CONFIG_DIR
@@ -103,33 +104,37 @@ class BitrixBrowserAutomation:
 
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
         self._click_add_entry(page)
-        inputs = self._entry_inputs(page)
         date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
-        inputs[0].fill(date_text)
-        inputs[1].fill(str(entry.hours))
-        inputs[2].fill(str(entry.minutes))
-        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE))
-        comment.fill(entry.comment)
+        self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
         self._click_confirm_entry(page)
-        page.wait_for_timeout(700)
+        self._wait_until_entry_saved(page, entry)
 
     def _click_add_entry(self, page) -> None:
         if self._entry_form_is_open(page):
             return
-        button = page.get_by_text("Agregar entrada", exact=True)
-        try:
-            target = button.first
-            if target.is_visible(timeout=1500) and target.is_enabled(timeout=500):
-                target.click()
-                page.wait_for_timeout(300)
-                return
-        except Exception:
-            pass
+        button = page.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada")
+        for index in range(button.count()):
+            try:
+                target = button.nth(index)
+                if target.is_visible(timeout=600) and target.is_enabled(timeout=600):
+                    target.click()
+                    self._wait_for_entry_form(page)
+                    return
+            except Exception:
+                continue
         if self._entry_form_is_open(page):
             return
         raise BitrixBrowserError(
             "El boton Agregar entrada no esta disponible. Abra el formulario de entrada en Seguimiento del tiempo y vuelva a intentar."
         )
+
+    def _wait_for_entry_form(self, page) -> None:
+        try:
+            page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.wait_for(state="visible", timeout=5000)
+            return
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError("Bitrix no mostro el formulario de entrada despues de pulsar Agregar entrada.") from exc
 
     def _entry_form_is_open(self, page) -> bool:
         try:
@@ -137,41 +142,99 @@ class BitrixBrowserAutomation:
         except Exception:
             return False
 
-    def _entry_inputs(self, page):
-        inputs = page.locator("input:visible")
-        matches = []
+    def _fill_entry_fields(self, page, date_text: str, hours: int, minutes: int, comment_text: str) -> None:
+        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
+        try:
+            comment.wait_for(state="visible", timeout=3000)
+            container = self._entry_form_container(comment)
+            editable_inputs = self._editable_inputs(container)
+            date_input = self._find_input_by_value(editable_inputs, r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}")
+            hours_input = self._find_input_by_value(editable_inputs, r"\d+\s*h")
+            minutes_input = self._find_input_by_value(editable_inputs, r"\d+\s*min")
+            if not date_input or not hours_input or not minutes_input:
+                self._save_debug_artifacts(page)
+                raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el formulario activo.")
+            self._replace_input_value(date_input, date_text)
+            self._replace_input_value(hours_input, str(hours))
+            self._replace_input_value(minutes_input, str(minutes))
+            comment.fill(comment_text)
+        except BitrixBrowserError:
+            raise
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude llenar el formulario de Bitrix: {exc}") from exc
+
+    def _entry_form_container(self, comment):
+        return comment.locator("xpath=ancestor::*[.//input][1]")
+
+    def _editable_inputs(self, container):
+        inputs = container.locator("input:visible")
+        output = []
         for index in range(inputs.count()):
             item = inputs.nth(index)
             try:
                 input_type = (item.get_attribute("type", timeout=300) or "").lower()
-                if input_type in {"checkbox", "radio", "hidden"}:
+                readonly = item.get_attribute("readonly", timeout=300)
+                disabled = item.get_attribute("disabled", timeout=300)
+                if input_type in {"checkbox", "radio", "hidden"} or readonly is not None or disabled is not None:
                     continue
+                if item.is_visible(timeout=300) and item.is_enabled(timeout=300):
+                    output.append(item)
             except Exception:
-                pass
+                continue
+        return output
+
+    def _find_input_by_value(self, inputs: list, pattern: str):
+        regex = re.compile(pattern, re.IGNORECASE)
+        for item in inputs:
             try:
-                value = item.input_value(timeout=500)
+                if regex.search(item.input_value(timeout=300)):
+                    return item
             except Exception:
-                value = ""
-            if re.match(r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}", value) or value.endswith((" h", " min")):
-                matches.append(item)
-        if len(matches) >= 3:
-            return matches[-3:]
-        raise BitrixBrowserError("No encontre los campos Fecha, Horas y Minutos en el modal de Bitrix.")
+                continue
+        return None
+
+    def _replace_input_value(self, input_locator, value: str) -> None:
+        input_locator.click()
+        input_locator.press("Control+A")
+        input_locator.type(value)
 
     def _click_confirm_entry(self, page) -> None:
-        buttons = page.locator("button:visible, [role='button']:visible")
-        for index in range(buttons.count() - 1, -1, -1):
+        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
+        container = self._entry_form_container(comment)
+        buttons = container.locator("button:visible, [role='button']:visible")
+        for index in range(buttons.count()):
             button = buttons.nth(index)
             try:
                 label = " ".join((button.inner_text(timeout=300) or "").split())
-                aria = button.get_attribute("aria-label", timeout=300) or ""
                 class_name = button.get_attribute("class", timeout=300) or ""
-                if label in {"", "✓"} and ("ui-btn-primary" in class_name or "primary" in class_name or aria):
+                if label in {"", "✓"} and ("ui-btn-primary" in class_name or "primary" in class_name):
                     button.click()
                     return
             except Exception:
                 continue
-        page.keyboard.press("Enter")
+        page.keyboard.press("Control+Enter")
+
+    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry) -> None:
+        expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
+        try:
+            page.get_by_text(expected_date, exact=False).first.wait_for(state="visible", timeout=6000)
+            return
+        except Exception:
+            page.wait_for_timeout(1000)
+
+    def _save_debug_artifacts(self, page) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_dir = CONFIG_DIR / "bitrix_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            page.screenshot(path=str(debug_dir / f"bitrix_{timestamp}.png"), full_page=True)
+        except Exception:
+            pass
+        try:
+            (debug_dir / f"bitrix_{timestamp}.html").write_text(page.content(), encoding="utf-8")
+        except Exception:
+            pass
 
     def _is_visible_text(self, page, text: str) -> bool:
         try:
