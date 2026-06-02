@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -46,9 +47,11 @@ class BitrixBrowserAutomation:
             raise BitrixBrowserError("No hay dias diligenciados para automatizar en Bitrix.")
         self._validate_entries(entries)
         page = self._active_page()
-        page.goto(task.url, wait_until="domcontentloaded")
-        self._soft_wait_after_navigation(page)
+        if not self._current_page_has_task(page, task.task_id):
+            page.goto(self._canonical_task_url(page, task.task_id), wait_until="domcontentloaded")
+            self._soft_wait_after_navigation(page)
         self._ensure_task_page(page)
+        self._wait_for_task_card_ready(page, task)
         total = len(entries)
         for index, entry in enumerate(entries, start=1):
             self._progress(
@@ -85,6 +88,11 @@ class BitrixBrowserAutomation:
         self._validate_entries(entries)
         page = self._active_page()
         self._ensure_task_page(page)
+        task_id = self._task_id_from_url(page.url)
+        self._wait_for_task_card_ready(
+            page,
+            BitrixTaskTarget(task_id=task_id, title="", url=self._canonical_task_url(page, task_id)),
+        )
         total = len(entries)
         for index, entry in enumerate(entries, start=1):
             if progress_callback is not None:
@@ -185,9 +193,10 @@ class BitrixBrowserAutomation:
             self._save_debug_artifacts(page)
             raise BitrixBrowserError(f"El Codigo Proyecto coincide con varias tareas. Opciones: {options}")
         target = result[0]
-        page.goto(target["url"], wait_until="domcontentloaded")
+        clean_url = self._canonical_task_url(page, int(target["id"]))
+        page.goto(clean_url, wait_until="domcontentloaded")
         self._soft_wait_after_navigation(page)
-        return BitrixTaskTarget(task_id=int(target["id"]), title=target["title"], url=page.url)
+        return BitrixTaskTarget(task_id=int(target["id"]), title=target["title"], url=clean_url)
 
     def close(self) -> None:
         try:
@@ -238,6 +247,93 @@ class BitrixBrowserAutomation:
                 "Abra manualmente la tarea de Bitrix en el Chrome controlado antes de enviar."
             )
 
+    def _current_page_has_task(self, page, task_id: int) -> bool:
+        return f"/tasks/task/view/{task_id}/" in page.url
+
+    def _canonical_task_url(self, page, task_id: int) -> str:
+        user_id = self._current_user_id(page)
+        return f"{self.BASE_URL}/company/personal/user/{user_id}/tasks/task/view/{task_id}/"
+
+    def _wait_for_task_card_ready(self, page, task: BitrixTaskTarget, timeout_ms: int = 65000) -> None:
+        start = time.monotonic()
+        deadline = start + timeout_ms / 1000
+        reopened = False
+        reloaded = False
+        clean_url = self._canonical_task_url(page, task.task_id)
+        while time.monotonic() < deadline:
+            if self._task_card_is_ready(page, task.task_id):
+                return
+            elapsed = time.monotonic() - start
+            if not reopened and elapsed > 5:
+                self._open_full_task_card_from_shell(page, task)
+                reopened = True
+            if not reloaded and elapsed > 18:
+                page.goto(clean_url, wait_until="domcontentloaded")
+                self._soft_wait_after_navigation(page, 2200)
+                reloaded = True
+            page.wait_for_timeout(500)
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError(
+            "Bitrix se quedo cargando la tarea y no mostro la tarjeta completa. "
+            "No se escribio ningun seguimiento de tiempo."
+        )
+
+    def _task_card_is_ready(self, page, task_id: int) -> bool:
+        for context in self._interactive_contexts(page):
+            try:
+                ready = context.evaluate(
+                    """(taskId) => {
+                        const isVisible = (node) => {
+                            if (!node) {
+                                return false;
+                            }
+                            const style = window.getComputedStyle(node);
+                            const box = node.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && box.width > 0
+                                && box.height > 0;
+                        };
+                        const busy = [...document.querySelectorAll('[aria-busy="true"], .ui-skeleton, .tasks-skeleton')]
+                            .some(isVisible);
+                        const fullCard = document.querySelector(`.tasks-full-card[data-task-id="${taskId}"]`);
+                        const title = document.querySelector(`[data-task-id="${taskId}"][data-task-field-id="title"]`);
+                        const tracking = document.querySelector('.tasks-task-time-tracking');
+                        const addButton = [...document.querySelectorAll('button, [role="button"]')]
+                            .some((node) => (node.textContent || '').trim() === 'Agregar entrada');
+                        return Boolean((fullCard || title) && (tracking || addButton) && !busy);
+                    }""",
+                    str(task_id),
+                )
+                if ready:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _open_full_task_card_from_shell(self, page, task: BitrixTaskTarget) -> None:
+        try:
+            user_id = self._current_user_id(page)
+            page.evaluate(
+                """async ({ taskId, url, closeCompleteUrl }) => {
+                    const root = window.top || window;
+                    const runtime = root.BX?.Runtime || window.BX?.Runtime;
+                    if (!runtime?.loadExtension) {
+                        return;
+                    }
+                    const module = await runtime.loadExtension('tasks.v2.application.task-card');
+                    const taskCard = module?.TaskCard || root.BX?.Tasks?.V2?.Application?.TaskCard;
+                    taskCard?.showFullCard?.({ taskId, closeCompleteUrl, url });
+                }""",
+                {
+                    "taskId": task.task_id,
+                    "url": f"/company/personal/user/{user_id}/tasks/task/view/{task.task_id}/",
+                    "closeCompleteUrl": f"/company/personal/user/{user_id}/tasks/",
+                },
+            )
+        except Exception:
+            pass
+
     def _interactive_contexts(self, page):
         contexts = [page]
         try:
@@ -248,6 +344,9 @@ class BitrixBrowserAutomation:
 
     def _ensure_time_tracking_modal(self, page):
         modal_context = self._time_tracking_modal_context(page)
+        if modal_context is not None:
+            return modal_context
+        modal_context = self._open_time_tracking_modal_by_dom(page)
         if modal_context is not None:
             return modal_context
         for context in self._interactive_contexts(page):
@@ -280,6 +379,59 @@ class BitrixBrowserAutomation:
         raise BitrixBrowserError(
             "No pude abrir ni detectar el modal Seguimiento del tiempo en la pagina ni en sus iframes."
         )
+
+    def _open_time_tracking_modal_by_dom(self, page):
+        for context in self._interactive_contexts(page):
+            try:
+                opened = context.evaluate(
+                    """() => {
+                        const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const isVisible = (node) => {
+                            if (!node) {
+                                return false;
+                            }
+                            const style = window.getComputedStyle(node);
+                            const box = node.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && box.width > 0
+                                && box.height > 0;
+                        };
+                        const rows = [...document.querySelectorAll('.b24-field-list-row, .tasks-task-time-tracking')];
+                        const row = rows.find((node) => {
+                            if (!isVisible(node)) {
+                                return false;
+                            }
+                            if (node.matches('.tasks-task-time-tracking')) {
+                                return true;
+                            }
+                            return normalize(node.textContent).includes('seguimiento del tiempo');
+                        });
+                        if (!row) {
+                            return false;
+                        }
+                        const target = row.querySelector('.b24-hover-pill, button, [role="button"]') || row;
+                        target.scrollIntoView({ block: 'center', inline: 'center' });
+                        for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                            target.dispatchEvent(new MouseEvent(eventName, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                        }
+                        return true;
+                    }"""
+                )
+                if opened:
+                    modal_context = self._wait_for_time_tracking_modal(page)
+                    if modal_context is not None:
+                        return modal_context
+            except Exception:
+                modal_context = self._time_tracking_modal_context(page)
+                if modal_context is not None:
+                    return modal_context
+                continue
+        return None
 
     def _time_tracking_modal_context(self, page):
         for context in self._interactive_contexts(page):
@@ -572,13 +724,39 @@ class BitrixBrowserAutomation:
             try:
                 result = frame.evaluate(
                     """async ({ taskId, entry }) => {
-                        const service = window.BX?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
-                        const apiClient = window.BX?.Tasks?.V2?.Lib?.apiClient;
-                        const endpoint = window.BX?.Tasks?.V2?.Const?.Endpoint?.TaskTimeTrackingAdd;
-                        const text = window.BX?.Text;
-                        const timezone = window.BX?.Main?.timezone;
+                        const loaded = [];
+                        const loadErrors = [];
+                        const runtime = window.BX?.Runtime || window.top?.BX?.Runtime;
+                        const tryLoad = async (name) => {
+                            try {
+                                if (runtime?.loadExtension) {
+                                    await runtime.loadExtension(name);
+                                    loaded.push(name);
+                                }
+                            } catch (error) {
+                                loadErrors.push(`${name}: ${error?.message || error}`);
+                            }
+                        };
+                        await tryLoad('tasks.v2.application.task-card');
+                        await tryLoad('tasks.v2.provider.service.time-tracking-service');
+                        await tryLoad('tasks.v2.component.fields.time-tracking');
+                        const bxCandidates = [window.BX, window.top?.BX].filter(Boolean);
+                        const service = bxCandidates
+                            .map((bx) => bx?.Tasks?.V2?.Provider?.Service?.timeTrackingService)
+                            .find(Boolean);
+                        const apiClient = bxCandidates
+                            .map((bx) => bx?.Tasks?.V2?.Lib?.apiClient)
+                            .find(Boolean);
+                        const endpoint = bxCandidates
+                            .map((bx) => bx?.Tasks?.V2?.Const?.Endpoint?.TaskTimeTrackingAdd)
+                            .find(Boolean);
+                        const text = bxCandidates.map((bx) => bx?.Text).find(Boolean);
+                        const timezone = bxCandidates.map((bx) => bx?.Main?.timezone).find(Boolean);
                         if (!service && (!apiClient || !endpoint)) {
-                            return { ok: false, error: 'Bitrix no expuso servicio ni API interna de seguimiento.' };
+                            return {
+                                ok: false,
+                                error: `Bitrix no expuso servicio ni API interna de seguimiento. loaded=${loaded.join(',')} errors=${loadErrors.join(' | ')}`,
+                            };
                         }
                         const localTarget = new Date(
                             entry.year,
