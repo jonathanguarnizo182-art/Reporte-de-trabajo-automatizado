@@ -19,7 +19,7 @@ from .calendar_utils import SPANISH_MONTHS, calculate_effective_hours, classify_
 from .catalog import ClientCatalog, ReportCatalog, normalize_name, extract_report_metadata
 from .bitrix_browser import BitrixBrowserAutomation, BitrixBrowserError
 from .config import AppConfig, load_config, save_config
-from .models import BitrixTimeEntry, ClientProject, GeneratedEntry, NewReportMetadata, ReportTemplate, TimeSegment, WorkdayPayload
+from .models import BitrixTaskTarget, BitrixTimeEntry, ClientProject, GeneratedEntry, NewReportMetadata, ReportTemplate, TimeSegment, WorkdayPayload
 from .scheduler import install_tasks
 from .word_service import WordReportService, WordUnavailableError
 
@@ -174,18 +174,29 @@ class UpdateModeDialog(Toplevel):
 
 
 class BitrixEntriesDialog(Toplevel):
-    def __init__(self, parent, entries: list[BitrixTimeEntry]):
+    def __init__(
+        self,
+        parent,
+        entries: list[BitrixTimeEntry],
+        project_code: str = "",
+        task: BitrixTaskTarget | None = None,
+    ):
         super().__init__(parent)
-        self.title("Enviar a Bitrix")
+        self.title("Automatizar Bitrix")
         self.result: list[BitrixTimeEntry] | None = None
         self.entries = entries
-        self.geometry("900x420")
+        self.geometry("980x500")
         self.transient(parent)
         self.grab_set()
 
         container = ttk.Frame(self, padding=12)
         container.pack(fill=BOTH, expand=True)
-        ttk.Label(container, text="Revise las entradas que se enviaran a Seguimiento del tiempo.").pack(anchor="w")
+        summary = "Revise los dias que se automatizaran en Bitrix."
+        if project_code:
+            summary += f"\nCodigo Proyecto: {project_code}"
+        if task is not None:
+            summary += f"\nTarea detectada: {task.title}\nURL: {task.url}"
+        ttk.Label(container, text=summary, justify=LEFT).pack(anchor="w")
 
         list_frame = ttk.Frame(container)
         list_frame.pack(fill=BOTH, expand=True, pady=(8, 8))
@@ -199,13 +210,13 @@ class BitrixEntriesDialog(Toplevel):
             preview = " ".join(entry.comment.split())[:110]
             self.listbox.insert(
                 END,
-                f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start} | {entry.duration_text} | {preview}",
+                f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end or '?'} | {entry.duration_text} | {preview}",
             )
         self.listbox.select_set(0, END)
 
         buttons = ttk.Frame(container)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Enviar seleccionadas", command=self._accept).pack(side=LEFT)
+        ttk.Button(buttons, text="Automatizar seleccionadas", command=self._accept).pack(side=LEFT)
         ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side=LEFT, padx=8)
 
     def _accept(self) -> None:
@@ -641,7 +652,7 @@ class ReportAutomationApp:
         ttk.Button(toolbar, text="Copiar", command=self._copy_text).pack(side=LEFT)
         ttk.Button(toolbar, text="Ver", command=lambda: self._load_current_day_entry(show_errors=True)).pack(side=LEFT, padx=8)
         ttk.Button(toolbar, text="Abrir Bitrix", command=self._open_bitrix_browser).pack(side=LEFT, padx=(18, 8))
-        self.bitrix_send_button = ttk.Button(toolbar, text="Enviar a Bitrix", command=self._send_report_to_bitrix)
+        self.bitrix_send_button = ttk.Button(toolbar, text="Automatizar Bitrix", command=self._send_report_to_bitrix)
         self.bitrix_send_button.pack(side=LEFT)
         self.notes_widget = Text(text_frame, wrap="word")
         self._configure_notes_formatting()
@@ -904,7 +915,7 @@ class ReportAutomationApp:
     def _open_bitrix_browser(self) -> None:
         try:
             self.bitrix_browser.open_browser()
-            self.status_var.set("Chrome de Bitrix abierto. Abra manualmente la tarea correcta.")
+            self.status_var.set("Chrome de Bitrix abierto. La automatizacion buscara la tarea por Codigo Proyecto.")
         except Exception as exc:
             LOGGER.exception("Error abriendo Bitrix: %s", exc)
             messagebox.showerror("Error al abrir Bitrix", str(exc))
@@ -917,26 +928,52 @@ class ReportAutomationApp:
             return
         try:
             report = self._selected_report()
-            entries = self.word_service.list_bitrix_time_entries(report.template_path)
+            payload = self.word_service.bitrix_report_payload(report.template_path)
         except Exception as exc:
             LOGGER.exception("Error leyendo entradas para Bitrix: %s", exc)
             messagebox.showerror("Error al leer reporte", str(exc))
             return
-        if not entries:
+        if not payload.project_code:
+            messagebox.showerror("Sin Codigo Proyecto", "El reporte seleccionado no tiene Codigo Proyecto para buscar la tarea.")
+            return
+        if not payload.entries:
             messagebox.showinfo("Sin entradas", "El reporte seleccionado no tiene actividades diligenciadas para enviar.")
             return
 
-        dialog = BitrixEntriesDialog(self.root, entries)
+        self._set_bitrix_busy(True, f"Buscando tarea en Bitrix: {payload.project_code}...")
+        try:
+            task = self.bitrix_browser.find_task_for_project(payload.project_code)
+        except BitrixBrowserError as exc:
+            self.status_var.set("No fue posible ubicar la tarea en Bitrix.")
+            messagebox.showerror("Error en Bitrix", str(exc))
+            self._set_bitrix_busy(False)
+            return
+        except Exception as exc:
+            LOGGER.exception("Error buscando tarea en Bitrix: %s", exc)
+            self.status_var.set("No fue posible ubicar la tarea en Bitrix.")
+            messagebox.showerror("Error en Bitrix", str(exc))
+            self._set_bitrix_busy(False)
+            return
+        self._set_bitrix_busy(False)
+
+        dialog = BitrixEntriesDialog(self.root, payload.entries, payload.project_code, task)
         self.root.wait_window(dialog)
         if not dialog.result:
-            self.status_var.set("Envio a Bitrix cancelado.")
+            self.status_var.set("Automatizacion de Bitrix cancelada.")
             return
 
-        self._set_bitrix_busy(True, f"Enviando {len(dialog.result)} entradas a Bitrix...")
+        self._set_bitrix_busy(True, f"Automatizando Bitrix para {len(dialog.result)} dias...")
         try:
-            self.bitrix_browser.send_time_entries(dialog.result, progress_callback=self._update_bitrix_progress)
-            self.status_var.set(f"Entradas enviadas a Bitrix: {len(dialog.result)}.")
-            messagebox.showinfo("Bitrix actualizado", f"Se enviaron {len(dialog.result)} entradas a Seguimiento del tiempo.")
+            self.bitrix_browser.automate_report_for_task(
+                task,
+                dialog.result,
+                progress_callback=self._update_bitrix_status,
+            )
+            self.status_var.set(f"Bitrix automatizado para {len(dialog.result)} dias.")
+            messagebox.showinfo(
+                "Bitrix actualizado",
+                f"Se automatizaron Seguimiento del tiempo y Tiempo de trabajo para {len(dialog.result)} dias.",
+            )
         except BitrixBrowserError as exc:
             self.status_var.set("No fue posible enviar a Bitrix.")
             messagebox.showerror("Error en Bitrix", str(exc))
@@ -958,6 +995,10 @@ class ReportAutomationApp:
         self.status_var.set(
             f"Enviando {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
         )
+        self.root.update_idletasks()
+
+    def _update_bitrix_status(self, message: str) -> None:
+        self.status_var.set(message)
         self.root.update_idletasks()
 
     def _create_new_report(self) -> None:

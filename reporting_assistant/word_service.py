@@ -13,7 +13,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from .calendar_utils import calculate_effective_hours, default_schedule_for_day, month_last_day
 from .catalog import ResolvedDocument
-from .models import BitrixTimeEntry, GeneratedEntry, NewReportMetadata, TimeSegment
+from .models import BitrixReportPayload, BitrixTimeEntry, GeneratedEntry, NewReportMetadata, TimeSegment
 
 try:
     import pythoncom  # type: ignore
@@ -110,12 +110,14 @@ class WordReportService:
             except ValueError:
                 continue
             starts = [value.strip() for value in self._xml_cell_text(table, 1, 4).splitlines() if value.strip()]
+            ends = [value.strip() for value in self._xml_cell_text(table, 1, 6).splitlines() if value.strip()]
             effective_values = [value.strip() for value in self._xml_cell_text(table, 1, 8).splitlines() if value.strip()]
             for index, effective in enumerate(effective_values):
                 duration = self._parse_effective_duration(effective)
                 if duration is None:
                     continue
                 start = starts[index] if index < len(starts) else starts[0] if starts else "08:00"
+                end = ends[index] if index < len(ends) else ends[0] if ends else ""
                 entries.append(
                     BitrixTimeEntry(
                         target_date=target_date,
@@ -124,9 +126,15 @@ class WordReportService:
                         minutes=duration[1],
                         comment=body,
                         source_label=f"{raw_date} {start}",
+                        end=end,
                     )
                 )
         return entries
+
+    def bitrix_report_payload(self, path: Path) -> BitrixReportPayload:
+        root = self._read_document_xml(path)
+        project_code = self._project_code_xml(root)
+        return BitrixReportPayload(project_code=project_code, entries=self.list_bitrix_time_entries(path))
 
     def write_day_block(
         self,
@@ -314,6 +322,30 @@ class WordReportService:
             if text:
                 parts.append(text)
         return "\n".join(parts).strip()
+
+    def _project_code_xml(self, root) -> str:
+        tables = root.findall(".//w:tbl", self.NS)
+        labels = ("Código Proyecto:", "Codigo Proyecto:", "REQUERIMIENTO:")
+        for table in tables[:2]:
+            for label in labels:
+                value = self._xml_value_after_label(table, label)
+                if value:
+                    return value
+        return ""
+
+    def _xml_value_after_label(self, table, label: str) -> str:
+        normalized_label = self._normalize_label(label)
+        inline_prefix = self._normalize_label(label.rstrip(":"))
+        for row_index, row in enumerate(self._xml_rows(table), start=1):
+            cells = row.findall("./w:tc", self.NS)
+            for column_index, _cell in enumerate(cells, start=1):
+                cell_text = " ".join(self._xml_cell_text(table, row_index, column_index).split())
+                normalized_cell = self._normalize_label(cell_text)
+                if normalized_cell == normalized_label and column_index < len(cells):
+                    return self._xml_cell_text(table, row_index, column_index + 1).strip()
+                if normalized_cell.startswith(inline_prefix) and ":" in cell_text:
+                    return cell_text.split(":", 1)[1].strip()
+        return ""
 
     def _set_xml_value_after_label(self, table, label: str, value: str) -> bool:
         if value is None:

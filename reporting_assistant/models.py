@@ -21,10 +21,26 @@ class BitrixTimeEntry:
     minutes: int
     comment: str
     source_label: str = ""
+    end: str = ""
+    break_duration: str = "01:00"
+    workday_reason: str = "Olvidé marcar la salida"
 
     @property
     def duration_text(self) -> str:
         return f"{self.hours:02d}:{self.minutes:02d}"
+
+
+@dataclass(slots=True)
+class BitrixTaskTarget:
+    task_id: int
+    title: str
+    url: str
+
+
+@dataclass(slots=True)
+class BitrixReportPayload:
+    project_code: str
+    entries: list[BitrixTimeEntry]
 
 
 @dataclass(slots=True)

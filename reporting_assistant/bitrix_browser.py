@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import CONFIG_DIR
-from .models import BitrixTimeEntry
+from .models import BitrixTaskTarget, BitrixTimeEntry
 
 
 class BitrixBrowserError(RuntimeError):
@@ -14,6 +14,8 @@ class BitrixBrowserError(RuntimeError):
 
 
 class BitrixBrowserAutomation:
+    BASE_URL = "https://grupo-aci.bitrix24.es"
+
     def __init__(self, profile_dir: str | Path | None = None):
         self.profile_dir = Path(profile_dir) if profile_dir else CONFIG_DIR / "bitrix_chrome_profile"
         self._playwright = None
@@ -24,6 +26,56 @@ class BitrixBrowserAutomation:
         page = self._active_page()
         page.goto(url, wait_until="domcontentloaded")
         page.bring_to_front()
+
+    def find_task_for_project(self, project_code: str) -> BitrixTaskTarget:
+        project_code = project_code.strip()
+        if not project_code:
+            raise BitrixBrowserError("El reporte no tiene Codigo Proyecto para buscar la tarea en Bitrix.")
+        page = self._active_page()
+        self._open_tasks_page(page)
+        self._search_task(page, project_code)
+        return self._open_unique_task_result(page, project_code)
+
+    def automate_report_for_task(
+        self,
+        task: BitrixTaskTarget,
+        entries: list[BitrixTimeEntry],
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        if not entries:
+            raise BitrixBrowserError("No hay dias diligenciados para automatizar en Bitrix.")
+        self._validate_entries(entries)
+        page = self._active_page()
+        page.goto(task.url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
+        self._ensure_task_page(page)
+        self._progress(progress_callback, "Abriendo Seguimiento del tiempo...")
+        self._ensure_time_tracking_modal(page)
+        total = len(entries)
+        for index, entry in enumerate(entries, start=1):
+            self._progress(
+                progress_callback,
+                f"Seguimiento {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}",
+            )
+            self._add_time_entry(page, entry)
+
+        self._close_time_tracking_modal(page)
+        for index, entry in enumerate(entries, start=1):
+            self._progress(
+                progress_callback,
+                f"Jornada {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end}",
+            )
+            self._fill_workday_entry(page, entry)
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=15000)
+
+        self._open_worktime_page(page)
+        for index, entry in enumerate(entries, start=1):
+            self._progress(
+                progress_callback,
+                f"Vinculando jornada {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')}",
+            )
+            self._link_worktime_day_to_task(page, entry, task.url)
 
     def send_time_entries(
         self,
@@ -41,6 +93,80 @@ class BitrixBrowserAutomation:
             if progress_callback is not None:
                 progress_callback(index, total, entry)
             self._add_time_entry(page, entry)
+
+    def _progress(self, callback: Callable[[str], None] | None, message: str) -> None:
+        if callback is not None:
+            callback(message)
+
+    def _open_tasks_page(self, page) -> None:
+        user_id = self._current_user_id(page)
+        page.goto(f"{self.BASE_URL}/company/personal/user/{user_id}/tasks/", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
+        try:
+            page.get_by_text("Tareas y proyectos", exact=True).first.wait_for(state="visible", timeout=6000)
+        except Exception:
+            pass
+
+    def _search_task(self, page, query: str) -> None:
+        search_inputs = [
+            page.get_by_placeholder(re.compile("buscar", re.IGNORECASE)).first,
+            page.locator(".main-ui-filter-search input:visible").first,
+            page.locator("input[class*='main-ui-filter']:visible").first,
+            page.locator("input:visible").first,
+        ]
+        last_error = None
+        for search in search_inputs:
+            try:
+                search.wait_for(state="visible", timeout=5000)
+                search.click()
+                search.press("Control+A")
+                search.fill(query)
+                search.press("Enter")
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(1500)
+                return
+            except Exception as exc:
+                last_error = exc
+                continue
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError(f"No pude escribir el Codigo Proyecto en el buscador de tareas: {last_error}")
+
+    def _open_unique_task_result(self, page, project_code: str) -> BitrixTaskTarget:
+        result = page.evaluate(
+            """(query) => {
+                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const wanted = normalize(query);
+                const anchors = [...document.querySelectorAll('a[href*="/tasks/task/view/"]')];
+                const matches = [];
+                for (const anchor of anchors) {
+                    const text = normalize(anchor.innerText || anchor.textContent || '');
+                    const href = anchor.href || '';
+                    if (!text || !href || !text.includes(wanted)) {
+                        continue;
+                    }
+                    const id = (href.match(/\\/tasks\\/task\\/view\\/(\\d+)\\//) || [])[1];
+                    if (!id) {
+                        continue;
+                    }
+                    if (!matches.some((item) => item.id === id)) {
+                        matches.push({ id, title: (anchor.innerText || anchor.textContent || '').trim(), url: href });
+                    }
+                }
+                return matches;
+            }""",
+            project_code,
+        )
+        if not result:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No encontre una tarea de Bitrix para: {project_code}")
+        if len(result) > 1:
+            options = "; ".join(item.get("title", "") for item in result[:5])
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"El Codigo Proyecto coincide con varias tareas. Opciones: {options}")
+        target = result[0]
+        page.goto(target["url"], wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
+        return BitrixTaskTarget(task_id=int(target["id"]), title=target["title"], url=page.url)
 
     def close(self) -> None:
         try:
@@ -111,10 +237,223 @@ class BitrixBrowserAutomation:
             "No pude abrir el modal Seguimiento del tiempo. Abra ese modal en Bitrix y vuelva a enviar."
         )
 
+    def _close_time_tracking_modal(self, page) -> None:
+        try:
+            close_buttons = page.locator(
+                ".tasks-task-time-tracking-sheet-close, [aria-label*='Cerrar'], [title*='Cerrar']"
+            )
+            for index in range(close_buttons.count()):
+                button = close_buttons.nth(index)
+                if button.is_visible(timeout=300):
+                    button.click()
+                    page.wait_for_timeout(800)
+                    return
+        except Exception:
+            pass
+
+    def _fill_workday_entry(self, page, entry: BitrixTimeEntry) -> None:
+        if not entry.end:
+            raise BitrixBrowserError(f"La fecha {entry.source_label} no tiene hora fin en el reporte.")
+        self._open_workday_widget(page)
+        self._start_workday_if_needed(page)
+        self._open_workday_editor(page)
+        self._fill_workday_editor(page, entry)
+
+    def _open_workday_widget(self, page) -> None:
+        candidates = [
+            page.locator("[class*='timeman']:visible").filter(has_text=re.compile(r"\d{1,2}:\d{2}")).first,
+            page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile(r"\d{1,2}:\d{2}")).last,
+            page.get_by_text(re.compile(r"\d{1,2}:\d{2}")).last,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.is_visible(timeout=1500):
+                    candidate.click()
+                    page.wait_for_timeout(1000)
+                    return
+            except Exception:
+                continue
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("No pude abrir el widget superior de Tiempo de trabajo.")
+
+    def _start_workday_if_needed(self, page) -> None:
+        for label in ("Iniciar", "Empezar"):
+            try:
+                button = page.get_by_text(label, exact=True).first
+                if button.is_visible(timeout=800) and button.is_enabled(timeout=800):
+                    button.click()
+                    page.wait_for_timeout(1200)
+                    return
+            except Exception:
+                continue
+
+    def _open_workday_editor(self, page) -> None:
+        candidates = [
+            page.locator("[title*='Editar']:visible").first,
+            page.locator("[aria-label*='Editar']:visible").first,
+            page.locator(".ui-icon-set.--edit, [class*='edit']").first,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.is_visible(timeout=1200):
+                    candidate.click()
+                    page.get_by_text("Editar el dia de trabajo", exact=False).wait_for(timeout=6000)
+                    return
+            except Exception:
+                continue
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("No pude abrir la edicion del dia de trabajo.")
+
+    def _fill_workday_editor(self, page, entry: BitrixTimeEntry) -> None:
+        date_text = entry.target_date.strftime("%d/%m/%Y")
+        start_hour, start_minute = self._parse_start_time(entry.start)
+        end_hour, end_minute = self._parse_start_time(entry.end)
+        try:
+            inputs = self._visible_inputs(page)
+            numeric_inputs = [item for item in inputs if self._input_value(item).strip().isdigit()]
+            if len(numeric_inputs) >= 4:
+                self._replace_input_value(numeric_inputs[0], f"{start_hour:02d}")
+                self._replace_input_value(numeric_inputs[1], f"{start_minute:02d}")
+                self._replace_input_value(numeric_inputs[2], f"{end_hour:02d}")
+                self._replace_input_value(numeric_inputs[3], f"{end_minute:02d}")
+
+            date_inputs = [item for item in inputs if re.search(r"\d{2}/\d{2}/\d{4}", self._input_value(item))]
+            if len(date_inputs) < 2:
+                self._click_change_day(page)
+                inputs = self._visible_inputs(page)
+                date_inputs = [item for item in inputs if re.search(r"\d{2}/\d{2}/\d{4}", self._input_value(item))]
+            for date_input in date_inputs[:2]:
+                self._replace_input_value(date_input, date_text, re.escape(date_text))
+
+            break_input = self._find_workday_break_input(page)
+            if break_input is not None:
+                self._replace_input_value(break_input, entry.break_duration, re.escape(entry.break_duration))
+
+            reason = page.locator("textarea:visible").last
+            reason.fill(entry.workday_reason)
+            self._click_finalize_workday(page)
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude diligenciar el tiempo de trabajo de {date_text}: {exc}") from exc
+
+    def _click_change_day(self, page) -> None:
+        try:
+            page.get_by_text("Cambiar el dia", exact=False).first.click()
+            page.wait_for_timeout(800)
+        except Exception:
+            try:
+                page.get_by_text("Cambiar el día", exact=False).first.click()
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+    def _find_workday_break_input(self, page):
+        inputs = self._visible_inputs(page)
+        candidates = [
+            item
+            for item in inputs
+            if re.search(r"^\d{1,2}:\d{2}$", self._input_value(item).strip()) and self._input_value(item).strip() not in {"00:00"}
+        ]
+        if candidates:
+            return candidates[-1]
+        return None
+
+    def _click_finalize_workday(self, page) -> None:
+        buttons = page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile("FINALIZAR", re.IGNORECASE))
+        for index in range(buttons.count()):
+            button = buttons.nth(index)
+            try:
+                if button.is_enabled(timeout=600):
+                    button.click()
+                    page.wait_for_load_state("networkidle", timeout=12000)
+                    page.wait_for_timeout(1200)
+                    return
+            except Exception:
+                continue
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("No pude pulsar Finalizar en el dia de trabajo.")
+
+    def _open_worktime_page(self, page) -> None:
+        candidates = [
+            page.get_by_text("Tiempo de trabajo", exact=True).first,
+            page.locator("[title*='Tiempo de trabajo']:visible").first,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.is_visible(timeout=1500):
+                    candidate.click()
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    page.wait_for_timeout(1200)
+                    return
+            except Exception:
+                continue
+        user_id = self._current_user_id(page)
+        page.goto(f"{self.BASE_URL}/company/personal/user/{user_id}/timeman/", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
+
+    def _current_user_id(self, page) -> str:
+        try:
+            value = page.evaluate("() => window.BX?.message?.('USER_ID') || window.BX?.message?.USER_ID")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        match = re.search(r"/company/personal/user/(\d+)/", page.url)
+        if match:
+            return match.group(1)
+        return "487"
+
+    def _link_worktime_day_to_task(self, page, entry: BitrixTimeEntry, task_url: str) -> None:
+        date_label = entry.target_date.strftime("%d/%m/%Y")
+        self._open_worktime_day_details(page, entry)
+        try:
+            editor = page.locator("textarea:visible, [contenteditable='true']:visible").last
+            if editor.evaluate("el => el.tagName.toLowerCase()") == "textarea":
+                editor.fill(task_url)
+            else:
+                editor.click()
+                page.keyboard.type(task_url)
+            page.wait_for_timeout(1200)
+            send = page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile("ENVIAR", re.IGNORECASE))
+            send.first.click()
+            page.wait_for_timeout(1200)
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude vincular la jornada {date_label} con la tarea: {exc}") from exc
+
+    def _open_worktime_day_details(self, page, entry: BitrixTimeEntry) -> None:
+        duration_patterns = [
+            f"{entry.hours} h {entry.minutes} m",
+            f"{entry.hours} h",
+            f"{entry.hours:02d}:{entry.minutes:02d}",
+        ]
+        for pattern in duration_patterns:
+            try:
+                target = page.get_by_text(pattern, exact=False).first
+                if target.is_visible(timeout=1200):
+                    target.click()
+                    page.wait_for_timeout(1200)
+                    return
+            except Exception:
+                continue
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError(
+            f"No pude abrir el detalle de Tiempo de trabajo para {entry.target_date.strftime('%d/%m/%Y')}."
+        )
+
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
         self._discard_open_entry_form(page)
-        saved_id = self._add_time_entry_via_bitrix_service(page, entry)
-        self._wait_until_entry_saved(page, entry, saved_id)
+        try:
+            saved_id = self._add_time_entry_via_bitrix_service(page, entry)
+            self._wait_until_entry_saved(page, entry, saved_id)
+            return
+        except BitrixBrowserError:
+            self._discard_open_entry_form(page)
+        self._click_add_entry(page)
+        date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
+        self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
+        self._click_confirm_entry(page)
+        self._wait_until_entry_saved(page, entry)
 
     def _add_time_entry_via_bitrix_service(self, page, entry: BitrixTimeEntry) -> str:
         task_id = self._task_id_from_url(page.url)
@@ -306,6 +645,28 @@ class BitrixBrowserAutomation:
             except Exception:
                 continue
         return output
+
+    def _visible_inputs(self, container):
+        inputs = container.locator("input:visible")
+        output = []
+        for index in range(inputs.count()):
+            item = inputs.nth(index)
+            try:
+                input_type = (item.get_attribute("type", timeout=300) or "").lower()
+                disabled = item.get_attribute("disabled", timeout=300)
+                if input_type in {"checkbox", "radio", "hidden"} or disabled is not None:
+                    continue
+                if item.is_visible(timeout=300) and item.is_enabled(timeout=300):
+                    output.append(item)
+            except Exception:
+                continue
+        return output
+
+    def _input_value(self, input_locator) -> str:
+        try:
+            return input_locator.input_value(timeout=300)
+        except Exception:
+            return ""
 
     def _find_input_by_value(self, inputs: list, pattern: str):
         regex = re.compile(pattern, re.IGNORECASE)
