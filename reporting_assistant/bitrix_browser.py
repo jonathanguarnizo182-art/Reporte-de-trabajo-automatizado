@@ -242,24 +242,53 @@ class BitrixBrowserAutomation:
             )
 
     def _ensure_time_tracking_modal(self, page) -> None:
-        if self._is_visible_text(page, "Seguimiento del tiempo"):
+        if self._time_tracking_modal_is_open(page):
             return
         candidates = [
-            page.get_by_text("Seguimiento del tiempo", exact=True),
+            page.get_by_text(re.compile(r"Seguimiento\s+del\s+tiempo", re.IGNORECASE)),
             page.locator("[title*='Seguimiento'][title*='tiempo']"),
             page.locator("[aria-label*='Seguimiento'][aria-label*='tiempo']"),
+            page.locator("[class*='time-tracking']:visible"),
+            page.locator("[class*='timer']:visible").filter(has_text=re.compile(r"\d{1,3}:\d{2}")),
         ]
         for candidate in candidates:
             try:
                 if candidate.first.is_visible(timeout=1200):
                     candidate.first.click()
-                    page.get_by_text("Seguimiento del tiempo", exact=True).wait_for(timeout=5000)
+                    self._wait_for_time_tracking_modal(page)
                     return
             except Exception:
+                if self._time_tracking_modal_is_open(page):
+                    return
                 continue
+        if self._time_tracking_modal_is_open(page):
+            return
         raise BitrixBrowserError(
             "No pude abrir el modal Seguimiento del tiempo. Abra ese modal en Bitrix y vuelva a enviar."
         )
+
+    def _time_tracking_modal_is_open(self, page) -> bool:
+        checks = [
+            page.get_by_text("Agregar entrada", exact=True).first,
+            page.locator(".tasks-task-time-tracking-sheet:visible").first,
+            page.locator(".tasks-time-tracking-list:visible").first,
+            page.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada").first,
+        ]
+        for check in checks:
+            try:
+                if check.is_visible(timeout=500):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_for_time_tracking_modal(self, page) -> None:
+        for _ in range(12):
+            if self._time_tracking_modal_is_open(page):
+                return
+            page.wait_for_timeout(250)
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("Bitrix abrio la tarea, pero no pude confirmar el modal Seguimiento del tiempo.")
 
     def _close_time_tracking_modal(self, page) -> None:
         try:
