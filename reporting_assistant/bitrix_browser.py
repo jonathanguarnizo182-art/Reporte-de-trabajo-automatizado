@@ -85,7 +85,6 @@ class BitrixBrowserAutomation:
         self._validate_entries(entries)
         page = self._active_page()
         self._ensure_task_page(page)
-        self._ensure_time_tracking_modal(page)
         total = len(entries)
         for index, entry in enumerate(entries, start=1):
             if progress_callback is not None:
@@ -492,13 +491,21 @@ class BitrixBrowserAutomation:
 
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
         self._discard_open_entry_form(page)
+        service_error = None
         try:
             saved_id = self._add_time_entry_via_bitrix_service(page, entry)
             self._wait_until_entry_saved(page, entry, saved_id)
             return
-        except BitrixBrowserError:
+        except BitrixBrowserError as exc:
+            service_error = exc
             self._discard_open_entry_form(page)
-        self._ensure_time_tracking_modal(page)
+        try:
+            self._ensure_time_tracking_modal(page)
+        except BitrixBrowserError as exc:
+            raise BitrixBrowserError(
+                "No pude guardar la entrada por el servicio interno de Bitrix y tampoco pude usar "
+                f"el modal visual. Error interno: {service_error}"
+            ) from exc
         self._click_add_entry(page)
         date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
         self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
@@ -517,46 +524,88 @@ class BitrixBrowserAutomation:
             "seconds": entry.hours * 3600 + entry.minutes * 60,
             "text": entry.comment,
         }
-        try:
-            result = page.evaluate(
-                """async ({ taskId, entry }) => {
-                    const service = window.BX?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
-                    const text = window.BX?.Text;
-                    const timezone = window.BX?.Main?.timezone;
-                    if (!service) {
-                        return { ok: false, error: 'Bitrix no expuso timeTrackingService en esta pagina.' };
-                    }
-                    const localTarget = new Date(entry.year, entry.month - 1, entry.day, entry.hour, entry.minute, 0, 0);
-                    let createdAtMs = localTarget.getTime();
-                    if (timezone?.getOffset) {
-                        createdAtMs = localTarget.getTime() - timezone.getOffset(localTarget.getTime());
-                        createdAtMs = localTarget.getTime() - timezone.getOffset(createdAtMs);
-                    }
-                    const item = {
-                        id: text?.getRandom ? text.getRandom() : `codex-${Date.now()}-${Math.random()}`,
-                        taskId,
-                        createdAtTs: Math.floor(createdAtMs / 1000),
-                        seconds: entry.seconds,
-                        text: entry.text,
-                        source: 'manual',
-                        rights: { edit: true, remove: true },
-                    };
-                    const id = await service.add(taskId, item);
-                    if (id && service.list) {
-                        await service.list(taskId, { reset: true });
-                    }
-                    return { ok: Boolean(id), id: String(id), createdAtTs: item.createdAtTs };
-                }""",
-                {"taskId": task_id, "entry": payload},
-            )
-        except Exception as exc:
-            self._save_debug_artifacts(page)
-            raise BitrixBrowserError(f"No pude enviar la entrada por el servicio interno de Bitrix: {exc}") from exc
-        if not result or not result.get("ok"):
-            self._save_debug_artifacts(page)
+        errors = []
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(
+                    """async ({ taskId, entry }) => {
+                        const service = window.BX?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
+                        const apiClient = window.BX?.Tasks?.V2?.Lib?.apiClient;
+                        const endpoint = window.BX?.Tasks?.V2?.Const?.Endpoint?.TaskTimeTrackingAdd;
+                        const text = window.BX?.Text;
+                        const timezone = window.BX?.Main?.timezone;
+                        if (!service && (!apiClient || !endpoint)) {
+                            return { ok: false, error: 'Bitrix no expuso servicio ni API interna de seguimiento.' };
+                        }
+                        const localTarget = new Date(
+                            entry.year,
+                            entry.month - 1,
+                            entry.day,
+                            entry.hour,
+                            entry.minute,
+                            0,
+                            0,
+                        );
+                        let createdAtMs = localTarget.getTime();
+                        if (timezone?.getOffset) {
+                            createdAtMs = localTarget.getTime() - timezone.getOffset(localTarget.getTime());
+                            createdAtMs = localTarget.getTime() - timezone.getOffset(createdAtMs);
+                        }
+                        const item = {
+                            id: text?.getRandom ? text.getRandom() : `codex-${Date.now()}-${Math.random()}`,
+                            taskId,
+                            createdAtTs: Math.floor(createdAtMs / 1000),
+                            seconds: entry.seconds,
+                            text: entry.text,
+                            source: 'manual',
+                            rights: { edit: true, remove: true },
+                        };
+                        if (service) {
+                            const id = await service.add(taskId, item);
+                            if (id) {
+                                if (service.list) {
+                                    await service.list(taskId, { reset: true });
+                                }
+                                return { ok: true, id: String(id), method: 'service', createdAtTs: item.createdAtTs };
+                            }
+                        }
+                        if (apiClient && endpoint) {
+                            const added = await apiClient.post(endpoint, {
+                                task: {
+                                    id: taskId,
+                                    elapsedTime: {
+                                        id: item.id,
+                                        taskId: item.taskId,
+                                        seconds: item.seconds,
+                                        source: item.source,
+                                        text: item.text,
+                                        createdAtTs: item.createdAtTs,
+                                        rights: item.rights,
+                                    },
+                                },
+                            });
+                            if (added?.id) {
+                                if (service?.list) {
+                                    await service.list(taskId, { reset: true });
+                                }
+                                return { ok: true, id: String(added.id), method: 'api', createdAtTs: item.createdAtTs };
+                            }
+                            return { ok: false, error: `API interna sin ID de respuesta: ${JSON.stringify(added)}` };
+                        }
+                        return { ok: false, error: 'Servicio interno no devolvio ID.' };
+                    }""",
+                    {"taskId": task_id, "entry": payload},
+                )
+            except Exception as exc:
+                errors.append(f"{frame.url}: {exc}")
+                continue
+            if result and result.get("ok"):
+                return str(result["id"])
             error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
-            raise BitrixBrowserError(f"Bitrix no acepto la entrada de tiempo por API interna: {error}")
-        return str(result["id"])
+            errors.append(f"{frame.url}: {error}")
+        self._save_debug_artifacts(page)
+        detail = " | ".join(errors[-5:]) if errors else "no hubo frames disponibles"
+        raise BitrixBrowserError(f"Bitrix no acepto la entrada de tiempo por API interna: {detail}")
 
     def _task_id_from_url(self, url: str) -> int:
         match = re.search(r"/tasks/task/view/(\d+)/", url)
@@ -854,7 +903,10 @@ class BitrixBrowserAutomation:
         return False
 
     def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry, saved_id: str | None = None) -> None:
-        if saved_id and self._entry_exists_in_bitrix_store(page, saved_id):
+        if saved_id:
+            if self._entry_exists_in_bitrix_store(page, saved_id):
+                return
+            page.wait_for_timeout(700)
             return
         expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
         expected_duration = f"{entry.hours:02d}:{entry.minutes:02d}:00"
@@ -870,20 +922,24 @@ class BitrixBrowserAutomation:
             ) from exc
 
     def _entry_exists_in_bitrix_store(self, page, saved_id: str) -> bool:
-        try:
-            return bool(
-                page.evaluate(
-                    """(id) => {
-                        const store = window.BX?.Tasks?.V2?.Core?.getStore?.();
-                        const model = window.BX?.Tasks?.V2?.Const?.Model?.ElapsedTimes;
-                        const getter = model ? store?.getters?.[`${model}/getById`] : null;
-                        return Boolean(getter?.(id) || getter?.(Number(id)));
-                    }""",
-                    str(saved_id),
+        for frame in page.frames:
+            try:
+                exists = bool(
+                    frame.evaluate(
+                        """(id) => {
+                            const store = window.BX?.Tasks?.V2?.Core?.getStore?.();
+                            const model = window.BX?.Tasks?.V2?.Const?.Model?.ElapsedTimes;
+                            const getter = model ? store?.getters?.[`${model}/getById`] : null;
+                            return Boolean(getter?.(id) || getter?.(Number(id)));
+                        }""",
+                        str(saved_id),
+                    )
                 )
-            )
-        except Exception:
-            return False
+                if exists:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _discard_open_entry_form(self, page) -> None:
         forms = page.locator(".tasks-time-tracking-list-item-edit")
