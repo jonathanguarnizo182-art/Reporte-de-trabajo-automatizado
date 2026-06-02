@@ -47,7 +47,7 @@ class BitrixBrowserAutomation:
         self._validate_entries(entries)
         page = self._active_page()
         page.goto(task.url, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=15000)
+        self._soft_wait_after_navigation(page)
         self._ensure_task_page(page)
         self._progress(progress_callback, "Abriendo Seguimiento del tiempo...")
         self._ensure_time_tracking_modal(page)
@@ -67,7 +67,7 @@ class BitrixBrowserAutomation:
             )
             self._fill_workday_entry(page, entry)
             page.reload(wait_until="domcontentloaded")
-            page.wait_for_load_state("networkidle", timeout=15000)
+            self._soft_wait_after_navigation(page)
 
         self._open_worktime_page(page)
         for index, entry in enumerate(entries, start=1):
@@ -98,10 +98,17 @@ class BitrixBrowserAutomation:
         if callback is not None:
             callback(message)
 
+    def _soft_wait_after_navigation(self, page, timeout_ms: int = 1800) -> None:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        page.wait_for_timeout(timeout_ms)
+
     def _open_tasks_page(self, page) -> None:
         user_id = self._current_user_id(page)
         page.goto(f"{self.BASE_URL}/company/personal/user/{user_id}/tasks/", wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=15000)
+        self._soft_wait_after_navigation(page)
         try:
             page.get_by_text("Tareas y proyectos", exact=True).first.wait_for(state="visible", timeout=6000)
         except Exception:
@@ -122,8 +129,7 @@ class BitrixBrowserAutomation:
                 search.press("Control+A")
                 search.fill(query)
                 search.press("Enter")
-                page.wait_for_load_state("networkidle", timeout=15000)
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2500)
                 return
             except Exception as exc:
                 last_error = exc
@@ -165,7 +171,7 @@ class BitrixBrowserAutomation:
             raise BitrixBrowserError(f"El Codigo Proyecto coincide con varias tareas. Opciones: {options}")
         target = result[0]
         page.goto(target["url"], wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=15000)
+        self._soft_wait_after_navigation(page)
         return BitrixTaskTarget(task_id=int(target["id"]), title=target["title"], url=page.url)
 
     def close(self) -> None:
@@ -365,8 +371,7 @@ class BitrixBrowserAutomation:
             try:
                 if button.is_enabled(timeout=600):
                     button.click()
-                    page.wait_for_load_state("networkidle", timeout=12000)
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(1800)
                     return
             except Exception:
                 continue
@@ -382,14 +387,13 @@ class BitrixBrowserAutomation:
             try:
                 if candidate.is_visible(timeout=1500):
                     candidate.click()
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(1800)
                     return
             except Exception:
                 continue
         user_id = self._current_user_id(page)
         page.goto(f"{self.BASE_URL}/company/personal/user/{user_id}/timeman/", wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=15000)
+        self._soft_wait_after_navigation(page)
 
     def _current_user_id(self, page) -> str:
         try:
