@@ -49,8 +49,6 @@ class BitrixBrowserAutomation:
         page.goto(task.url, wait_until="domcontentloaded")
         self._soft_wait_after_navigation(page)
         self._ensure_task_page(page)
-        self._progress(progress_callback, "Abriendo Seguimiento del tiempo...")
-        self._ensure_time_tracking_modal(page)
         total = len(entries)
         for index, entry in enumerate(entries, start=1):
             self._progress(
@@ -500,6 +498,7 @@ class BitrixBrowserAutomation:
             return
         except BitrixBrowserError:
             self._discard_open_entry_form(page)
+        self._ensure_time_tracking_modal(page)
         self._click_add_entry(page)
         date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
         self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
@@ -855,6 +854,8 @@ class BitrixBrowserAutomation:
         return False
 
     def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry, saved_id: str | None = None) -> None:
+        if saved_id and self._entry_exists_in_bitrix_store(page, saved_id):
+            return
         expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
         expected_duration = f"{entry.hours:02d}:{entry.minutes:02d}:00"
         try:
@@ -863,8 +864,6 @@ class BitrixBrowserAutomation:
             page.get_by_text(expected_duration, exact=False).first.wait_for(state="visible", timeout=6000)
             return
         except Exception as exc:
-            if saved_id and self._entry_exists_in_bitrix_store(page, saved_id):
-                return
             self._save_debug_artifacts(page)
             raise BitrixBrowserError(
                 f"No pude confirmar que Bitrix guardara la entrada {expected_date} ({expected_duration})."
