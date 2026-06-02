@@ -325,12 +325,15 @@ class WordReportService:
 
     def _project_code_xml(self, root) -> str:
         tables = root.findall(".//w:tbl", self.NS)
-        labels = ("Código Proyecto:", "Codigo Proyecto:", "REQUERIMIENTO:")
-        for table in tables[:2]:
-            for label in labels:
+        for label in ("Código Proyecto:", "Codigo Proyecto:"):
+            for table in tables:
                 value = self._xml_value_after_label(table, label)
                 if value:
                     return value
+        for table in tables[:1]:
+            value = self._xml_value_after_label(table, "REQUERIMIENTO:")
+            if value:
+                return value
         return ""
 
     def _xml_value_after_label(self, table, label: str) -> str:
