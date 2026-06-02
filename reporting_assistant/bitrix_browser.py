@@ -140,25 +140,43 @@ class BitrixBrowserAutomation:
     def _open_unique_task_result(self, page, project_code: str) -> BitrixTaskTarget:
         result = page.evaluate(
             """(query) => {
-                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const normalize = (value) => (value || '')
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/\\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
                 const wanted = normalize(query);
                 const anchors = [...document.querySelectorAll('a[href*="/tasks/task/view/"]')];
-                const matches = [];
+                const allTasks = [];
+                const strongMatches = [];
                 for (const anchor of anchors) {
-                    const text = normalize(anchor.innerText || anchor.textContent || '');
                     const href = anchor.href || '';
-                    if (!text || !href || !text.includes(wanted)) {
-                        continue;
-                    }
                     const id = (href.match(/\\/tasks\\/task\\/view\\/(\\d+)\\//) || [])[1];
                     if (!id) {
                         continue;
                     }
-                    if (!matches.some((item) => item.id === id)) {
-                        matches.push({ id, title: (anchor.innerText || anchor.textContent || '').trim(), url: href });
+                    const row = anchor.closest('tr, .main-grid-row, [class*="task"], [class*="item"]');
+                    const anchorTitle = (anchor.innerText || anchor.textContent || '').trim();
+                    const rowTitle = (row?.innerText || row?.textContent || anchorTitle).trim();
+                    const text = normalize(`${anchorTitle} ${rowTitle}`);
+                    const item = { id, title: anchorTitle || rowTitle, url: href, text };
+                    if (!allTasks.some((existing) => existing.id === id)) {
+                        allTasks.push(item);
+                    }
+                    if (text.includes(wanted) && !strongMatches.some((existing) => existing.id === id)) {
+                        strongMatches.push(item);
                     }
                 }
-                return matches;
+                if (strongMatches.length > 0) {
+                    return strongMatches.map(({ id, title, url }) => ({ id, title, url }));
+                }
+                if (allTasks.length === 1) {
+                    return allTasks.map(({ id, title, url }) => ({ id, title, url }));
+                }
+                const queryTokens = wanted.split(/\\s+/).filter((token) => token.length >= 3);
+                const tokenMatches = allTasks.filter((item) => queryTokens.every((token) => item.text.includes(token)));
+                return tokenMatches.map(({ id, title, url }) => ({ id, title, url }));
             }""",
             project_code,
         )
