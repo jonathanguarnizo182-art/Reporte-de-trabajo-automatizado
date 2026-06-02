@@ -238,38 +238,65 @@ class BitrixBrowserAutomation:
                 "Abra manualmente la tarea de Bitrix en el Chrome controlado antes de enviar."
             )
 
-    def _ensure_time_tracking_modal(self, page) -> None:
-        if self._time_tracking_modal_is_open(page):
-            return
-        candidates = [
-            page.get_by_text(re.compile(r"Seguimiento\s+del\s+tiempo", re.IGNORECASE)),
-            page.locator("[title*='Seguimiento'][title*='tiempo']"),
-            page.locator("[aria-label*='Seguimiento'][aria-label*='tiempo']"),
-            page.locator("[class*='time-tracking']:visible"),
-            page.locator("[class*='timer']:visible").filter(has_text=re.compile(r"\d{1,3}:\d{2}")),
-        ]
-        for candidate in candidates:
-            try:
-                if candidate.first.is_visible(timeout=1200):
-                    candidate.first.click()
-                    self._wait_for_time_tracking_modal(page)
-                    return
-            except Exception:
-                if self._time_tracking_modal_is_open(page):
-                    return
-                continue
-        if self._time_tracking_modal_is_open(page):
-            return
+    def _interactive_contexts(self, page):
+        contexts = [page]
+        try:
+            contexts.extend(frame for frame in page.frames if frame is not page.main_frame)
+        except Exception:
+            pass
+        return contexts
+
+    def _ensure_time_tracking_modal(self, page):
+        modal_context = self._time_tracking_modal_context(page)
+        if modal_context is not None:
+            return modal_context
+        for context in self._interactive_contexts(page):
+            candidates = [
+                context.locator(".tasks-task-time-tracking:visible").first,
+                context.locator("[data-task-field-id*='timeTracking']:visible").first,
+                context.locator("[data-task-chip-id*='timeTracking']:visible").first,
+                context.get_by_text(re.compile(r"Seguimiento\s+del\s+tiempo", re.IGNORECASE)).first,
+                context.locator("[title*='Seguimiento'][title*='tiempo']").first,
+                context.locator("[aria-label*='Seguimiento'][aria-label*='tiempo']").first,
+                context.locator("[class*='time-tracking']:visible").first,
+                context.locator("[class*='timer']:visible").filter(has_text=re.compile(r"\d{1,3}:\d{2}")).first,
+            ]
+            for candidate in candidates:
+                try:
+                    if candidate.is_visible(timeout=1200):
+                        candidate.click()
+                        modal_context = self._wait_for_time_tracking_modal(page)
+                        if modal_context is not None:
+                            return modal_context
+                except Exception:
+                    modal_context = self._time_tracking_modal_context(page)
+                    if modal_context is not None:
+                        return modal_context
+                    continue
+        modal_context = self._time_tracking_modal_context(page)
+        if modal_context is not None:
+            return modal_context
+        self._save_debug_artifacts(page)
         raise BitrixBrowserError(
-            "No pude abrir el modal Seguimiento del tiempo. Abra ese modal en Bitrix y vuelva a enviar."
+            "No pude abrir ni detectar el modal Seguimiento del tiempo en la pagina ni en sus iframes."
         )
 
+    def _time_tracking_modal_context(self, page):
+        for context in self._interactive_contexts(page):
+            if self._time_tracking_modal_is_open_in_context(context):
+                return context
+        return None
+
     def _time_tracking_modal_is_open(self, page) -> bool:
+        return self._time_tracking_modal_context(page) is not None
+
+    def _time_tracking_modal_is_open_in_context(self, context) -> bool:
         checks = [
-            page.get_by_text("Agregar entrada", exact=True).first,
-            page.locator(".tasks-task-time-tracking-sheet:visible").first,
-            page.locator(".tasks-time-tracking-list:visible").first,
-            page.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada").first,
+            context.get_by_text("Agregar entrada", exact=True).first,
+            context.locator(".tasks-task-time-tracking-sheet:visible").first,
+            context.locator(".tasks-time-tracking-list:visible").first,
+            context.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada").first,
+            context.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first,
         ]
         for check in checks:
             try:
@@ -279,27 +306,29 @@ class BitrixBrowserAutomation:
                 continue
         return False
 
-    def _wait_for_time_tracking_modal(self, page) -> None:
+    def _wait_for_time_tracking_modal(self, page):
         for _ in range(12):
-            if self._time_tracking_modal_is_open(page):
-                return
+            modal_context = self._time_tracking_modal_context(page)
+            if modal_context is not None:
+                return modal_context
             page.wait_for_timeout(250)
         self._save_debug_artifacts(page)
         raise BitrixBrowserError("Bitrix abrio la tarea, pero no pude confirmar el modal Seguimiento del tiempo.")
 
     def _close_time_tracking_modal(self, page) -> None:
-        try:
-            close_buttons = page.locator(
-                ".tasks-task-time-tracking-sheet-close, [aria-label*='Cerrar'], [title*='Cerrar']"
-            )
-            for index in range(close_buttons.count()):
-                button = close_buttons.nth(index)
-                if button.is_visible(timeout=300):
-                    button.click()
-                    page.wait_for_timeout(800)
-                    return
-        except Exception:
-            pass
+        for context in self._interactive_contexts(page):
+            try:
+                close_buttons = context.locator(
+                    ".tasks-task-time-tracking-sheet-close, [aria-label*='Cerrar'], [title*='Cerrar']"
+                )
+                for index in range(close_buttons.count()):
+                    button = close_buttons.nth(index)
+                    if button.is_visible(timeout=300):
+                        button.click()
+                        page.wait_for_timeout(800)
+                        return
+            except Exception:
+                pass
 
     def _fill_workday_entry(self, page, entry: BitrixTimeEntry) -> None:
         if not entry.end:
@@ -500,17 +529,31 @@ class BitrixBrowserAutomation:
             service_error = exc
             self._discard_open_entry_form(page)
         try:
-            self._ensure_time_tracking_modal(page)
+            modal_context = self._ensure_time_tracking_modal(page)
         except BitrixBrowserError as exc:
             raise BitrixBrowserError(
                 "No pude guardar la entrada por el servicio interno de Bitrix y tampoco pude usar "
                 f"el modal visual. Error interno: {service_error}"
             ) from exc
-        self._click_add_entry(page)
+        try:
+            saved_id = self._add_time_entry_via_bitrix_service(page, entry)
+            self._wait_until_entry_saved(page, entry, saved_id, context=modal_context)
+            return
+        except BitrixBrowserError as exc:
+            service_error = exc
+            self._discard_open_entry_form(page)
+            modal_context = self._time_tracking_modal_context(page) or modal_context
+        self._click_add_entry(page, modal_context)
+        try:
+            saved_id = self._save_entry_via_vue_form(page, modal_context, entry)
+            self._wait_until_entry_saved(page, entry, saved_id, context=modal_context)
+            return
+        except BitrixBrowserError:
+            pass
         date_text = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}"
-        self._fill_entry_fields(page, date_text, entry.hours, entry.minutes, entry.comment)
-        self._click_confirm_entry(page)
-        self._wait_until_entry_saved(page, entry)
+        self._fill_entry_fields(page, modal_context, date_text, entry.hours, entry.minutes, entry.comment)
+        self._click_confirm_entry(page, modal_context)
+        self._wait_until_entry_saved(page, entry, context=modal_context)
 
     def _add_time_entry_via_bitrix_service(self, page, entry: BitrixTimeEntry) -> str:
         task_id = self._task_id_from_url(page.url)
@@ -634,41 +677,123 @@ class BitrixBrowserAutomation:
                 label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
                 raise BitrixBrowserError(f"La duracion de {label} esta en cero.")
 
-    def _click_add_entry(self, page) -> None:
-        if self._entry_form_is_open(page):
+    def _save_entry_via_vue_form(self, page, context, entry: BitrixTimeEntry) -> str:
+        hours, minutes = self._parse_start_time(entry.start)
+        payload = {
+            "year": entry.target_date.year,
+            "month": entry.target_date.month,
+            "day": entry.target_date.day,
+            "hour": hours,
+            "minute": minutes,
+            "seconds": entry.hours * 3600 + entry.minutes * 60,
+            "text": entry.comment,
+        }
+        try:
+            result = context.evaluate(
+                """async (entry) => {
+                    const editForms = [...document.querySelectorAll('.tasks-time-tracking-list-item-edit')];
+                    const roots = editForms
+                        .map((form) => form.closest('.tasks-time-tracking-list-item') || form)
+                        .filter(Boolean);
+                    const findComponent = (root) => {
+                        const nodes = [root, ...root.querySelectorAll('*')];
+                        for (const node of nodes) {
+                            let component = node.__vueParentComponent || null;
+                            while (component) {
+                                const ctx = component.ctx || {};
+                                if (typeof ctx.handleSave === 'function') {
+                                    return ctx;
+                                }
+                                component = component.parent || null;
+                            }
+                        }
+                        return null;
+                    };
+                    let component = null;
+                    for (const root of roots) {
+                        component = findComponent(root);
+                        if (component) {
+                            break;
+                        }
+                    }
+                    if (!component) {
+                        return { ok: false, error: 'No encontre el componente Vue del formulario de tiempo.' };
+                    }
+                    const localTarget = new Date(
+                        entry.year,
+                        entry.month - 1,
+                        entry.day,
+                        entry.hour,
+                        entry.minute,
+                        0,
+                        0,
+                    );
+                    const timezone = window.BX?.Main?.timezone;
+                    let createdAtMs = localTarget.getTime();
+                    if (timezone?.getOffset) {
+                        createdAtMs = localTarget.getTime() - timezone.getOffset(localTarget.getTime());
+                    }
+                    const beforeId = component.localElapsedId || component.elapsedId || '';
+                    await component.handleSave({
+                        createdAtTs: Math.floor(createdAtMs / 1000),
+                        seconds: entry.seconds,
+                        text: entry.text,
+                        source: 'manual',
+                        rights: { edit: true, remove: true },
+                    });
+                    const id = component.localElapsedId || beforeId || '';
+                    return { ok: true, id: String(id) };
+                }""",
+                payload,
+            )
+        except Exception as exc:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude guardar la entrada desde el componente visual de Bitrix: {exc}") from exc
+        if not result or not result.get("ok"):
+            error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"Bitrix no acepto la entrada desde el componente visual: {error}")
+        return str(result.get("id") or "")
+
+    def _click_add_entry(self, page, context) -> None:
+        if self._entry_form_is_open(context):
             return
-        button = page.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada")
+        button = context.locator("button:visible, [role='button']:visible").filter(has_text="Agregar entrada")
         for index in range(button.count()):
             try:
                 target = button.nth(index)
                 if target.is_visible(timeout=600) and target.is_enabled(timeout=600):
                     target.click()
-                    self._wait_for_entry_form(page)
+                    self._wait_for_entry_form(page, context)
                     return
             except Exception:
                 continue
-        if self._entry_form_is_open(page):
+        if self._entry_form_is_open(context):
             return
+        self._save_debug_artifacts(page)
         raise BitrixBrowserError(
             "El boton Agregar entrada no esta disponible. Abra el formulario de entrada en Seguimiento del tiempo y vuelva a intentar."
         )
 
-    def _wait_for_entry_form(self, page) -> None:
+    def _wait_for_entry_form(self, page, context) -> None:
         try:
-            page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.wait_for(state="visible", timeout=5000)
+            context.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.wait_for(
+                state="visible",
+                timeout=5000,
+            )
             return
         except Exception as exc:
             self._save_debug_artifacts(page)
             raise BitrixBrowserError("Bitrix no mostro el formulario de entrada despues de pulsar Agregar entrada.") from exc
 
-    def _entry_form_is_open(self, page) -> bool:
+    def _entry_form_is_open(self, context) -> bool:
         try:
-            return page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.is_visible(timeout=500)
+            return context.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first.is_visible(timeout=500)
         except Exception:
             return False
 
-    def _fill_entry_fields(self, page, date_text: str, hours: int, minutes: int, comment_text: str) -> None:
-        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
+    def _fill_entry_fields(self, page, context, date_text: str, hours: int, minutes: int, comment_text: str) -> None:
+        comment = context.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
         try:
             comment.wait_for(state="visible", timeout=3000)
             container = self._entry_form_container(comment)
@@ -679,7 +804,7 @@ class BitrixBrowserAutomation:
                 hours_input = self._find_input_by_value(editable_inputs, r"\d+\s*h")
                 minutes_input = self._find_input_by_value(editable_inputs, r"\d+\s*min")
             if date_input is None or hours_input is None or minutes_input is None:
-                page_inputs = self._editable_inputs(page)
+                page_inputs = self._editable_inputs(context)
                 if date_input is None:
                     date_input = self._find_input_by_label(page_inputs, "Fecha")
                 if hours_input is None:
@@ -875,12 +1000,12 @@ class BitrixBrowserAutomation:
         except Exception:
             page.wait_for_timeout(1000)
 
-    def _click_confirm_entry(self, page) -> None:
-        comment = page.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
+    def _click_confirm_entry(self, page, context) -> None:
+        comment = context.get_by_placeholder(re.compile("Comentario", re.IGNORECASE)).first
         container = self._entry_form_container(comment)
         if self._click_check_button(container.locator("button:visible")):
             return
-        if self._click_check_button(page.locator("button:visible")):
+        if self._click_check_button(context.locator("button:visible")):
             return
         self._save_debug_artifacts(page)
         raise BitrixBrowserError("No pude pulsar el chulo azul para guardar la entrada de tiempo.")
@@ -902,18 +1027,19 @@ class BitrixBrowserAutomation:
                 continue
         return False
 
-    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry, saved_id: str | None = None) -> None:
+    def _wait_until_entry_saved(self, page, entry: BitrixTimeEntry, saved_id: str | None = None, context=None) -> None:
         if saved_id:
             if self._entry_exists_in_bitrix_store(page, saved_id):
                 return
             page.wait_for_timeout(700)
             return
+        context = context or page
         expected_date = f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start.lstrip('0')}"
         expected_duration = f"{entry.hours:02d}:{entry.minutes:02d}:00"
         try:
-            page.locator(".tasks-time-tracking-list-item-edit").wait_for(state="detached", timeout=8000)
-            page.get_by_text(expected_date, exact=False).first.wait_for(state="visible", timeout=6000)
-            page.get_by_text(expected_duration, exact=False).first.wait_for(state="visible", timeout=6000)
+            context.locator(".tasks-time-tracking-list-item-edit").wait_for(state="detached", timeout=8000)
+            context.get_by_text(expected_date, exact=False).first.wait_for(state="visible", timeout=6000)
+            context.get_by_text(expected_duration, exact=False).first.wait_for(state="visible", timeout=6000)
             return
         except Exception as exc:
             self._save_debug_artifacts(page)
@@ -942,18 +1068,22 @@ class BitrixBrowserAutomation:
         return False
 
     def _discard_open_entry_form(self, page) -> None:
-        forms = page.locator(".tasks-time-tracking-list-item-edit")
-        if forms.count() == 0:
-            return
-        form = forms.first
-        try:
-            close_icon = form.locator(".tasks-time-tracking-list-item-edit-close-icon").first
-            if close_icon.is_visible(timeout=500):
-                close_icon.click()
-                form.wait_for(state="detached", timeout=3000)
-        except Exception as exc:
-            self._save_debug_artifacts(page)
-            raise BitrixBrowserError("Hay un formulario de Bitrix abierto que no se pudo cancelar antes de continuar.") from exc
+        for context in self._interactive_contexts(page):
+            forms = context.locator(".tasks-time-tracking-list-item-edit")
+            try:
+                if forms.count() == 0:
+                    continue
+                form = forms.first
+                close_icon = form.locator(".tasks-time-tracking-list-item-edit-close-icon").first
+                if close_icon.is_visible(timeout=500):
+                    close_icon.click()
+                    form.wait_for(state="detached", timeout=3000)
+                    return
+            except Exception as exc:
+                self._save_debug_artifacts(page)
+                raise BitrixBrowserError(
+                    "Hay un formulario de Bitrix abierto que no se pudo cancelar antes de continuar."
+                ) from exc
 
     def _save_debug_artifacts(self, page) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -965,6 +1095,22 @@ class BitrixBrowserAutomation:
             pass
         try:
             (debug_dir / f"bitrix_{timestamp}.html").write_text(page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        frame_lines = []
+        try:
+            for index, frame in enumerate(page.frames):
+                frame_lines.append(f"{index}: {frame.url}")
+                try:
+                    frame_html = frame.content()
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", frame.url or f"frame_{index}")[:80]
+                    (debug_dir / f"bitrix_{timestamp}_frame_{index}_{safe_name}.html").write_text(
+                        frame_html,
+                        encoding="utf-8",
+                    )
+                except Exception as exc:
+                    frame_lines.append(f"  html error: {exc}")
+            (debug_dir / f"bitrix_{timestamp}_frames.txt").write_text("\n".join(frame_lines), encoding="utf-8")
         except Exception:
             pass
 
