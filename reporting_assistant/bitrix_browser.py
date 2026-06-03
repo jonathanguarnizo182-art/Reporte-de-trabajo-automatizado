@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import CONFIG_DIR
-from .models import BitrixTaskTarget, BitrixTimeEntry
+from .models import BitrixTaskTarget, BitrixTimeEntry, TimeSegment
 
 
 class BitrixBrowserError(RuntimeError):
@@ -61,20 +61,26 @@ class BitrixBrowserAutomation:
             self._add_time_entry(page, entry)
 
         self._close_time_tracking_modal(page)
-        for index, entry in enumerate(entries, start=1):
+        workday_entries = [
+            segment_entry
+            for entry in entries
+            for segment_entry in self._workday_segment_entries(entry)
+        ]
+        workday_total = len(workday_entries)
+        for index, entry in enumerate(workday_entries, start=1):
             self._progress(
                 progress_callback,
-                f"Jornada {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end}",
+                f"Jornada {index}/{workday_total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end}",
             )
             self._fill_workday_entry(page, entry)
             page.reload(wait_until="domcontentloaded")
             self._soft_wait_after_navigation(page)
 
         self._open_worktime_page(page)
-        for index, entry in enumerate(entries, start=1):
+        for index, entry in enumerate(workday_entries, start=1):
             self._progress(
                 progress_callback,
-                f"Vinculando jornada {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')}",
+                f"Vinculando jornada {index}/{workday_total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end}",
             )
             self._link_worktime_day_to_task(page, entry, task.url)
 
@@ -102,6 +108,38 @@ class BitrixBrowserAutomation:
     def _progress(self, callback: Callable[[str], None] | None, message: str) -> None:
         if callback is not None:
             callback(message)
+
+    def _workday_segment_entries(self, entry: BitrixTimeEntry) -> list[BitrixTimeEntry]:
+        segments = entry.segments or [
+            TimeSegment(
+                start=entry.start,
+                end=entry.end,
+                effective=entry.duration_text,
+                label="tramo 1",
+            )
+        ]
+        output: list[BitrixTimeEntry] = []
+        for index, segment in enumerate(segments):
+            duration = self._parse_effective_duration(segment.effective)
+            if duration is None:
+                raise BitrixBrowserError(
+                    f"La duracion del tramo {index + 1} de {entry.source_label} no es valida: {segment.effective}."
+                )
+            output.append(
+                BitrixTimeEntry(
+                    target_date=entry.target_date,
+                    start=segment.start,
+                    hours=duration[0],
+                    minutes=duration[1],
+                    comment=entry.comment,
+                    source_label=f"{entry.target_date.strftime('%d/%m/%Y')} {segment.start}",
+                    end=segment.end,
+                    break_duration="01:00" if index == 0 else "00:00",
+                    workday_reason=entry.workday_reason,
+                    segments=[segment],
+                )
+            )
+        return output
 
     def _soft_wait_after_navigation(self, page, timeout_ms: int = 1800) -> None:
         try:
@@ -493,6 +531,9 @@ class BitrixBrowserAutomation:
     def _open_workday_widget(self, page) -> None:
         candidates = [
             page.locator("[class*='timeman']:visible").filter(has_text=re.compile(r"\d{1,2}:\d{2}")).first,
+            page.locator("[class*='timeman']:visible").first,
+            page.locator("[title*='Tiempo']:visible").first,
+            page.locator("[aria-label*='Tiempo']:visible").first,
             page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile(r"\d{1,2}:\d{2}")).last,
             page.get_by_text(re.compile(r"\d{1,2}:\d{2}")).last,
         ]
@@ -504,8 +545,53 @@ class BitrixBrowserAutomation:
                     return
             except Exception:
                 continue
+        if self._open_workday_widget_by_dom(page):
+            return
         self._save_debug_artifacts(page)
         raise BitrixBrowserError("No pude abrir el widget superior de Tiempo de trabajo.")
+
+    def _open_workday_widget_by_dom(self, page) -> bool:
+        try:
+            opened = page.evaluate(
+                """() => {
+                    const isVisible = (node) => {
+                        if (!node) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(node);
+                        const box = node.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && box.width > 0
+                            && box.height > 0;
+                    };
+                    const candidates = [...document.querySelectorAll(
+                        '[class*="timeman"], [id*="timeman"], [title*="Tiempo"], [aria-label*="Tiempo"], button, [role="button"]'
+                    )].filter(isVisible);
+                    const target = candidates.find((node) => {
+                        const text = (node.textContent || node.getAttribute('title') || node.getAttribute('aria-label') || '').trim();
+                        return /tiempo|jornada|\\d{1,2}:\\d{2}/i.test(text);
+                    });
+                    if (!target) {
+                        return false;
+                    }
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+                    for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                        target.dispatchEvent(new MouseEvent(eventName, {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                        }));
+                    }
+                    return true;
+                }"""
+            )
+            if opened:
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            pass
+        return False
 
     def _start_workday_if_needed(self, page) -> None:
         for label in ("Iniciar", "Empezar"):
@@ -651,10 +737,14 @@ class BitrixBrowserAutomation:
             raise BitrixBrowserError(f"No pude vincular la jornada {date_label} con la tarea: {exc}") from exc
 
     def _open_worktime_day_details(self, page, entry: BitrixTimeEntry) -> None:
+        durations = [(entry.hours, entry.minutes)]
+        clock_duration = self._clock_duration(entry.start, entry.end)
+        if clock_duration is not None and clock_duration not in durations:
+            durations.append(clock_duration)
         duration_patterns = [
-            f"{entry.hours} h {entry.minutes} m",
-            f"{entry.hours} h",
-            f"{entry.hours:02d}:{entry.minutes:02d}",
+            pattern
+            for hours, minutes in durations
+            for pattern in (f"{hours} h {minutes} m", f"{hours} h", f"{hours:02d}:{minutes:02d}")
         ]
         for pattern in duration_patterns:
             try:
@@ -669,6 +759,17 @@ class BitrixBrowserAutomation:
         raise BitrixBrowserError(
             f"No pude abrir el detalle de Tiempo de trabajo para {entry.target_date.strftime('%d/%m/%Y')}."
         )
+
+    def _clock_duration(self, start: str, end: str) -> tuple[int, int] | None:
+        try:
+            start_hour, start_minute = self._parse_start_time(start)
+            end_hour, end_minute = self._parse_start_time(end)
+        except BitrixBrowserError:
+            return None
+        total = (end_hour * 60 + end_minute) - (start_hour * 60 + start_minute)
+        if total < 0:
+            total += 24 * 60
+        return total // 60, total % 60
 
     def _add_time_entry(self, page, entry: BitrixTimeEntry) -> None:
         self._discard_open_entry_form(page)
@@ -844,6 +945,19 @@ class BitrixBrowserAutomation:
             raise BitrixBrowserError(f"La hora de inicio no es valida para Bitrix: {value}.")
         return hours, minutes
 
+    def _parse_effective_duration(self, value: str) -> tuple[int, int] | None:
+        match = re.search(r"(\d{1,3})\s*:\s*(\d{2})", value)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        hours_match = re.search(r"(\d{1,3})\s*h", value, flags=re.IGNORECASE)
+        minutes_match = re.search(r"(\d{1,3})\s*m", value, flags=re.IGNORECASE)
+        if hours_match or minutes_match:
+            return (
+                int(hours_match.group(1)) if hours_match else 0,
+                int(minutes_match.group(1)) if minutes_match else 0,
+            )
+        return None
+
     def _validate_entries(self, entries: list[BitrixTimeEntry]) -> None:
         for entry in entries:
             if not entry.target_date or not entry.start.strip() or not entry.comment.strip():
@@ -854,6 +968,13 @@ class BitrixBrowserAutomation:
             if entry.hours == 0 and entry.minutes == 0:
                 label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
                 raise BitrixBrowserError(f"La duracion de {label} esta en cero.")
+            for index, segment in enumerate(entry.segments):
+                if not segment.start.strip() or not segment.end.strip() or not segment.effective.strip():
+                    label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
+                    raise BitrixBrowserError(f"El tramo {index + 1} de {label} esta incompleto.")
+                if self._parse_effective_duration(segment.effective) is None:
+                    label = entry.source_label or entry.target_date.strftime("%d/%m/%Y")
+                    raise BitrixBrowserError(f"La duracion del tramo {index + 1} de {label} no es valida.")
 
     def _save_entry_via_vue_form(self, page, context, entry: BitrixTimeEntry) -> str:
         hours, minutes = self._parse_start_time(entry.start)

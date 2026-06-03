@@ -23,6 +23,7 @@ class BitrixTimeEntry:
     source_label: str = ""
     end: str = ""
     break_duration: str = "01:00"
+    segments: list[TimeSegment] = field(default_factory=list)
     workday_reason: str = "Olvidé marcar la salida"
 
     @property

@@ -112,23 +112,37 @@ class WordReportService:
             starts = [value.strip() for value in self._xml_cell_text(table, 1, 4).splitlines() if value.strip()]
             ends = [value.strip() for value in self._xml_cell_text(table, 1, 6).splitlines() if value.strip()]
             effective_values = [value.strip() for value in self._xml_cell_text(table, 1, 8).splitlines() if value.strip()]
+            if not effective_values:
+                continue
+            if len(effective_values) > len(starts) or len(effective_values) > len(ends):
+                raise RuntimeError(
+                    f"La fecha {raw_date} tiene mas duraciones que horas de inicio o fin. "
+                    "Revise HORA INICIO, HORA FIN y HORAS EFECTIVAS."
+                )
+            segments: list[TimeSegment] = []
+            total_minutes = 0
             for index, effective in enumerate(effective_values):
                 duration = self._parse_effective_duration(effective)
                 if duration is None:
                     continue
-                start = starts[index] if index < len(starts) else starts[0] if starts else "08:00"
-                end = ends[index] if index < len(ends) else ends[0] if ends else ""
-                entries.append(
-                    BitrixTimeEntry(
-                        target_date=target_date,
-                        start=start,
-                        hours=duration[0],
-                        minutes=duration[1],
-                        comment=body,
-                        source_label=f"{raw_date} {start}",
-                        end=end,
-                    )
+                start = starts[index]
+                end = ends[index]
+                segments.append(TimeSegment(start=start, end=end, effective=effective, label=f"tramo {index + 1}"))
+                total_minutes += duration[0] * 60 + duration[1]
+            if not segments:
+                continue
+            entries.append(
+                BitrixTimeEntry(
+                    target_date=target_date,
+                    start=segments[0].start,
+                    hours=total_minutes // 60,
+                    minutes=total_minutes % 60,
+                    comment=body,
+                    source_label=f"{raw_date} {segments[0].start}",
+                    end=segments[-1].end,
+                    segments=segments,
                 )
+            )
         return entries
 
     def bitrix_report_payload(self, path: Path) -> BitrixReportPayload:
