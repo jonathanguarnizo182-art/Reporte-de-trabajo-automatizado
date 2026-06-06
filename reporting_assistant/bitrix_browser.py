@@ -815,8 +815,21 @@ class BitrixBrowserAutomation:
         date_text = entry.target_date.strftime("%d/%m/%Y")
         start_hour, start_minute = self._parse_start_time(entry.start)
         end_hour, end_minute = self._parse_start_time(entry.end)
-        result = page.evaluate(
-            """({ start, end, startHour, startMinute, endHour, endMinute, dateText, breakDuration, reason }) => {
+        payload = {
+            "start": entry.start,
+            "end": entry.end,
+            "startHour": f"{start_hour:02d}",
+            "startMinute": f"{start_minute:02d}",
+            "endHour": f"{end_hour:02d}",
+            "endMinute": f"{end_minute:02d}",
+            "dateText": date_text,
+            "breakDuration": entry.break_duration,
+            "reason": entry.workday_reason,
+        }
+        result = None
+        for _ in range(24):
+            result = page.evaluate(
+                """({ start, end, startHour, startMinute, endHour, endMinute, dateText, breakDuration, reason }) => {
                 const isVisible = (node) => {
                     if (!node) {
                         return false;
@@ -828,10 +841,21 @@ class BitrixBrowserAutomation:
                         && box.width > 0
                         && box.height > 0;
                 };
-                const popup = [...document.querySelectorAll('[id^="timeman_edit_popup_"]')]
-                    .find((node) => isVisible(node));
+                const popups = [...document.querySelectorAll('[id^="timeman_edit_popup_"]')]
+                    .filter((node) => isVisible(node))
+                    .map((node) => ({
+                        node,
+                        title: /editar\\s+el\\s+d[ií]a\\s+de\\s+trabajo/i.test(node.textContent || ''),
+                        timeCount: node.querySelectorAll('input.bxc-cus-sel').length,
+                        hiddenCount: node.querySelectorAll('input[name="timeman_edit_from"], input[name="timeman_edit_to"]').length,
+                    }))
+                    .sort((a, b) => {
+                        const score = (item) => (item.title ? 100 : 0) + item.timeCount * 10 + item.hiddenCount;
+                        return score(b) - score(a);
+                    });
+                const popup = popups[0]?.node || null;
                 if (!popup) {
-                    return { ok: false, error: 'No encontre el popup de edicion de tiempo de trabajo.' };
+                    return { ok: false, notReady: true, error: 'No encontre el popup de edicion de tiempo de trabajo.' };
                 }
                 const setValue = (element, value) => {
                     if (!element) {
@@ -845,7 +869,11 @@ class BitrixBrowserAutomation:
                 };
                 const timeInputs = [...popup.querySelectorAll('input.bxc-cus-sel')];
                 if (timeInputs.length < 4) {
-                    return { ok: false, error: `Bitrix mostro ${timeInputs.length} campos de hora, se esperaban 4.` };
+                    return {
+                        ok: false,
+                        notReady: true,
+                        error: `Bitrix mostro ${timeInputs.length} campos de hora, se esperaban 4.`,
+                    };
                 }
                 setValue(popup.querySelector('input[name="timeman_edit_from"]'), start);
                 setValue(popup.querySelector('input[name="timeman_edit_to"]'), end);
@@ -876,18 +904,13 @@ class BitrixBrowserAutomation:
                     reasonValue: textarea?.value || '',
                 };
             }""",
-            {
-                "start": entry.start,
-                "end": entry.end,
-                "startHour": f"{start_hour:02d}",
-                "startMinute": f"{start_minute:02d}",
-                "endHour": f"{end_hour:02d}",
-                "endMinute": f"{end_minute:02d}",
-                "dateText": date_text,
-                "breakDuration": entry.break_duration,
-                "reason": entry.workday_reason,
-            },
-        )
+                payload,
+            )
+            if result and result.get("ok"):
+                break
+            if not isinstance(result, dict) or not result.get("notReady"):
+                break
+            page.wait_for_timeout(250)
         if not result or not result.get("ok"):
             error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
             raise BitrixBrowserError(f"Bitrix no permitio llenar el formulario de jornada: {error}")
