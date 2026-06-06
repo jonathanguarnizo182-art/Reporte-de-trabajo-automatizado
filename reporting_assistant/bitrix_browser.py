@@ -608,32 +608,191 @@ class BitrixBrowserAutomation:
         return False
 
     def _start_workday_if_needed(self, page) -> None:
-        for label in ("Iniciar", "Empezar"):
-            try:
-                button = page.get_by_text(label, exact=True).first
-                if button.is_visible(timeout=800) and button.is_enabled(timeout=800):
-                    button.click()
-                    page.wait_for_timeout(1200)
-                    return
-            except Exception:
-                continue
+        if self._workday_menu_has_state(page, "En el trabajo"):
+            return
+        if self._start_workday_from_profile_menu(page):
+            return
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError("No pude iniciar el widget superior de Tiempo de trabajo.")
+
+    def _workday_menu_has_state(self, page, state_text: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """(stateText) => {
+                        const isVisible = (node) => {
+                            if (!node) {
+                                return false;
+                            }
+                            const style = window.getComputedStyle(node);
+                            const box = node.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && box.width > 0
+                                && box.height > 0;
+                        };
+                        const pattern = new RegExp(stateText, 'i');
+                        return [...document.querySelectorAll('div, section, article')]
+                            .some((node) => {
+                                if (!isVisible(node)) {
+                                    return false;
+                                }
+                                const text = node.textContent || '';
+                                const box = node.getBoundingClientRect();
+                                return pattern.test(text)
+                                    && /\\d{1,3}:\\d{2}:\\d{2}/.test(text)
+                                    && box.width < 520
+                                    && box.height < 240;
+                            });
+                    }""",
+                    state_text,
+                )
+            )
+        except Exception:
+            return False
+
+    def _start_workday_from_profile_menu(self, page) -> bool:
+        try:
+            clicked = page.evaluate(
+                """() => {
+                    const isVisible = (node) => {
+                        if (!node) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(node);
+                        const box = node.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && box.width > 0
+                            && box.height > 0;
+                    };
+                    const clickNode = (node) => {
+                        node.scrollIntoView({ block: 'center', inline: 'center' });
+                        for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                            node.dispatchEvent(new MouseEvent(eventName, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                        }
+                    };
+                    const containers = [...document.querySelectorAll('div, section, article')]
+                        .filter((node) => isVisible(node) && /fuera del trabajo/i.test(node.textContent || ''));
+                    for (const container of containers) {
+                        const buttons = [...container.querySelectorAll('button, [role="button"], span, div')]
+                            .filter((node) => isVisible(node) && /^\\s*(Iniciar|Empezar)\\s*$/i.test(node.textContent || ''));
+                        if (buttons.length > 0) {
+                            clickNode(buttons[0]);
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                for _ in range(10):
+                    page.wait_for_timeout(300)
+                    if self._workday_menu_has_state(page, "En el trabajo"):
+                        return True
+                self._open_workday_widget(page)
+                for _ in range(8):
+                    page.wait_for_timeout(300)
+                    if self._workday_menu_has_state(page, "En el trabajo"):
+                        return True
+        except Exception:
+            pass
+        return False
 
     def _open_workday_editor(self, page) -> None:
+        if self._workday_editor_is_open(page):
+            return
         candidates = [
             page.locator("[title*='Editar']:visible").first,
             page.locator("[aria-label*='Editar']:visible").first,
-            page.locator(".ui-icon-set.--edit, [class*='edit']").first,
+            page.locator(".ui-icon-set.--edit, .ui-icon-set.--pencil, [class*='edit'], [class*='pencil']").first,
         ]
         for candidate in candidates:
             try:
                 if candidate.is_visible(timeout=1200):
                     candidate.click()
-                    page.get_by_text("Editar el dia de trabajo", exact=False).wait_for(timeout=6000)
+                    self._wait_for_workday_editor(page)
                     return
             except Exception:
                 continue
+        if self._open_workday_editor_by_dom(page):
+            return
         self._save_debug_artifacts(page)
         raise BitrixBrowserError("No pude abrir la edicion del dia de trabajo.")
+
+    def _workday_editor_is_open(self, page) -> bool:
+        try:
+            return page.get_by_text(re.compile(r"Editar\s+el\s+d[ií]a\s+de\s+trabajo", re.IGNORECASE)).first.is_visible(
+                timeout=500
+            )
+        except Exception:
+            return False
+
+    def _wait_for_workday_editor(self, page) -> None:
+        page.get_by_text(re.compile(r"Editar\s+el\s+d[ií]a\s+de\s+trabajo", re.IGNORECASE)).first.wait_for(
+            timeout=6000
+        )
+
+    def _open_workday_editor_by_dom(self, page) -> bool:
+        try:
+            opened = page.evaluate(
+                """() => {
+                    const isVisible = (node) => {
+                        if (!node) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(node);
+                        const box = node.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && box.width > 0
+                            && box.height > 0;
+                    };
+                    const clickNode = (node) => {
+                        node.scrollIntoView({ block: 'center', inline: 'center' });
+                        for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                            node.dispatchEvent(new MouseEvent(eventName, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                        }
+                    };
+                    const containers = [...document.querySelectorAll('div, section, article')]
+                        .filter((node) => isVisible(node) && /en el trabajo|fuera del trabajo/i.test(node.textContent || ''));
+                    const scopedCandidates = [];
+                    for (const container of containers) {
+                        scopedCandidates.push(...container.querySelectorAll(
+                            '[title*="Editar"], [aria-label*="Editar"], [class*="edit"], [class*="pencil"], svg, i, span, button'
+                        ));
+                    }
+                    const globalCandidates = [...document.querySelectorAll(
+                        '[title*="Editar"], [aria-label*="Editar"], [class*="edit"], [class*="pencil"], .ui-icon-set, svg, i, span, button'
+                    )];
+                    const candidates = [...scopedCandidates, ...globalCandidates].filter(isVisible);
+                    const target = candidates.find((node) => {
+                        const text = `${node.textContent || ''} ${node.getAttribute('title') || ''} ${node.getAttribute('aria-label') || ''} ${node.className || ''}`;
+                        const box = node.getBoundingClientRect();
+                        return /edit|editar|pencil|pen|lapiz|lápiz/i.test(text)
+                            || (box.width <= 40 && box.height <= 40 && containers.some((container) => container.contains(node)));
+                    });
+                    if (!target) {
+                        return false;
+                    }
+                    clickNode(target);
+                    return true;
+                }"""
+            )
+            if opened:
+                self._wait_for_workday_editor(page)
+                return True
+        except Exception:
+            pass
+        return False
 
     def _fill_workday_editor(self, page, entry: BitrixTimeEntry) -> None:
         date_text = entry.target_date.strftime("%d/%m/%Y")
