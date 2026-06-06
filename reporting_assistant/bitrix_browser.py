@@ -620,6 +620,12 @@ class BitrixBrowserAutomation:
             return bool(
                 page.evaluate(
                     """(stateText) => {
+                        const normalize = (value) => (value || '')
+                            .normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim()
+                            .toLowerCase();
                         const isVisible = (node) => {
                             if (!node) {
                                 return false;
@@ -631,19 +637,11 @@ class BitrixBrowserAutomation:
                                 && box.width > 0
                                 && box.height > 0;
                         };
-                        const pattern = new RegExp(stateText, 'i');
-                        return [...document.querySelectorAll('div, section, article')]
-                            .some((node) => {
-                                if (!isVisible(node)) {
-                                    return false;
-                                }
-                                const text = node.textContent || '';
-                                const box = node.getBoundingClientRect();
-                                return pattern.test(text)
-                                    && /\\d{1,3}:\\d{2}:\\d{2}/.test(text)
-                                    && box.width < 520
-                                    && box.height < 240;
-                            });
+                        const wanted = normalize(stateText);
+                        const panels = [...document.querySelectorAll(
+                            '#bx-avatar-header-popup, .tm-control-panel, .timeman-instant-container, [data-testid="bx-avatar-widget-content-main"]'
+                        )];
+                        return panels.some((node) => isVisible(node) && normalize(node.textContent).includes(wanted));
                     }""",
                     state_text,
                 )
@@ -762,6 +760,16 @@ class BitrixBrowserAutomation:
                             }));
                         }
                     };
+                    const explicitEditor = document.querySelector('.tm-timer__editor-opener');
+                    if (isVisible(explicitEditor)) {
+                        clickNode(explicitEditor);
+                        return true;
+                    }
+                    const explicitEditorIcon = document.querySelector('.tm-timer__editor-opener-img');
+                    if (isVisible(explicitEditorIcon)) {
+                        clickNode(explicitEditorIcon.closest('button') || explicitEditorIcon);
+                        return true;
+                    }
                     const containers = [...document.querySelectorAll('div, section, article')]
                         .filter((node) => isVisible(node) && /en el trabajo|fuera del trabajo/i.test(node.textContent || ''));
                     const scopedCandidates = [];
