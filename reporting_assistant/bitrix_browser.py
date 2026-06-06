@@ -804,35 +804,110 @@ class BitrixBrowserAutomation:
 
     def _fill_workday_editor(self, page, entry: BitrixTimeEntry) -> None:
         date_text = entry.target_date.strftime("%d/%m/%Y")
-        start_hour, start_minute = self._parse_start_time(entry.start)
-        end_hour, end_minute = self._parse_start_time(entry.end)
         try:
-            inputs = self._visible_inputs(page)
-            numeric_inputs = [item for item in inputs if self._input_value(item).strip().isdigit()]
-            if len(numeric_inputs) >= 4:
-                self._replace_input_value(numeric_inputs[0], f"{start_hour:02d}")
-                self._replace_input_value(numeric_inputs[1], f"{start_minute:02d}")
-                self._replace_input_value(numeric_inputs[2], f"{end_hour:02d}")
-                self._replace_input_value(numeric_inputs[3], f"{end_minute:02d}")
-
-            date_inputs = [item for item in inputs if re.search(r"\d{2}/\d{2}/\d{4}", self._input_value(item))]
-            if len(date_inputs) < 2:
-                self._click_change_day(page)
-                inputs = self._visible_inputs(page)
-                date_inputs = [item for item in inputs if re.search(r"\d{2}/\d{2}/\d{4}", self._input_value(item))]
-            for date_input in date_inputs[:2]:
-                self._replace_input_value(date_input, date_text, re.escape(date_text))
-
-            break_input = self._find_workday_break_input(page)
-            if break_input is not None:
-                self._replace_input_value(break_input, entry.break_duration, re.escape(entry.break_duration))
-
-            reason = page.locator("textarea:visible").last
-            reason.fill(entry.workday_reason)
-            self._click_finalize_workday(page)
+            self._fill_workday_editor_by_dom(page, entry)
+            self._click_save_workday(page)
         except Exception as exc:
             self._save_debug_artifacts(page)
             raise BitrixBrowserError(f"No pude diligenciar el tiempo de trabajo de {date_text}: {exc}") from exc
+
+    def _fill_workday_editor_by_dom(self, page, entry: BitrixTimeEntry) -> None:
+        date_text = entry.target_date.strftime("%d/%m/%Y")
+        start_hour, start_minute = self._parse_start_time(entry.start)
+        end_hour, end_minute = self._parse_start_time(entry.end)
+        result = page.evaluate(
+            """({ start, end, startHour, startMinute, endHour, endMinute, dateText, breakDuration, reason }) => {
+                const isVisible = (node) => {
+                    if (!node) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    const box = node.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && box.width > 0
+                        && box.height > 0;
+                };
+                const popup = [...document.querySelectorAll('[id^="timeman_edit_popup_"]')]
+                    .find((node) => isVisible(node));
+                if (!popup) {
+                    return { ok: false, error: 'No encontre el popup de edicion de tiempo de trabajo.' };
+                }
+                const setValue = (element, value) => {
+                    if (!element) {
+                        return false;
+                    }
+                    element.value = value;
+                    for (const eventName of ['input', 'change', 'keyup', 'blur']) {
+                        element.dispatchEvent(new Event(eventName, { bubbles: true }));
+                    }
+                    return true;
+                };
+                const timeInputs = [...popup.querySelectorAll('input.bxc-cus-sel')];
+                if (timeInputs.length < 4) {
+                    return { ok: false, error: `Bitrix mostro ${timeInputs.length} campos de hora, se esperaban 4.` };
+                }
+                setValue(popup.querySelector('input[name="timeman_edit_from"]'), start);
+                setValue(popup.querySelector('input[name="timeman_edit_to"]'), end);
+                setValue(timeInputs[0], startHour);
+                setValue(timeInputs[1], startMinute);
+                setValue(timeInputs[2], endHour);
+                setValue(timeInputs[3], endMinute);
+
+                const dateInputs = [...popup.querySelectorAll('input[data-role="date-picker"], input.bx-tm-popup-clock-wnd-custom-date-picker')];
+                for (const input of dateInputs) {
+                    setValue(input, dateText);
+                }
+                const breakInput = popup.querySelector('input.bx-tm-report-edit');
+                if (breakInput) {
+                    setValue(breakInput, breakDuration);
+                }
+                const textarea = popup.querySelector('textarea');
+                if (textarea) {
+                    setValue(textarea, reason);
+                }
+                return {
+                    ok: true,
+                    fromHidden: popup.querySelector('input[name="timeman_edit_from"]')?.value || '',
+                    toHidden: popup.querySelector('input[name="timeman_edit_to"]')?.value || '',
+                    visibleTimes: timeInputs.slice(0, 4).map((input) => input.value),
+                    dateValues: dateInputs.map((input) => input.value),
+                    breakValue: breakInput?.value || '',
+                    reasonValue: textarea?.value || '',
+                };
+            }""",
+            {
+                "start": entry.start,
+                "end": entry.end,
+                "startHour": f"{start_hour:02d}",
+                "startMinute": f"{start_minute:02d}",
+                "endHour": f"{end_hour:02d}",
+                "endMinute": f"{end_minute:02d}",
+                "dateText": date_text,
+                "breakDuration": entry.break_duration,
+                "reason": entry.workday_reason,
+            },
+        )
+        if not result or not result.get("ok"):
+            error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
+            raise BitrixBrowserError(f"Bitrix no permitio llenar el formulario de jornada: {error}")
+        expected_times = [f"{start_hour:02d}", f"{start_minute:02d}", f"{end_hour:02d}", f"{end_minute:02d}"]
+        if result.get("fromHidden") != entry.start or result.get("toHidden") != entry.end:
+            raise BitrixBrowserError(
+                f"Bitrix no tomo las horas ocultas. Esperado {entry.start}-{entry.end}, "
+                f"visible {result.get('fromHidden')}-{result.get('toHidden')}."
+            )
+        if result.get("visibleTimes") != expected_times:
+            raise BitrixBrowserError(
+                f"Bitrix no tomo las horas visibles. Esperado {expected_times}, visible {result.get('visibleTimes')}."
+            )
+        date_values = result.get("dateValues") or []
+        if date_values and any(value != date_text for value in date_values):
+            raise BitrixBrowserError(f"Bitrix no tomo la fecha {date_text}. Valores visibles: {date_values}.")
+        if result.get("breakValue") and result.get("breakValue") != entry.break_duration:
+            raise BitrixBrowserError(
+                f"Bitrix no tomo el descanso {entry.break_duration}. Valor visible: {result.get('breakValue')}."
+            )
 
     def _click_change_day(self, page) -> None:
         try:
@@ -856,19 +931,52 @@ class BitrixBrowserAutomation:
             return candidates[-1]
         return None
 
-    def _click_finalize_workday(self, page) -> None:
-        buttons = page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile("FINALIZAR", re.IGNORECASE))
-        for index in range(buttons.count()):
-            button = buttons.nth(index)
-            try:
-                if button.is_enabled(timeout=600):
-                    button.click()
-                    page.wait_for_timeout(1800)
-                    return
-            except Exception:
-                continue
+    def _click_save_workday(self, page) -> None:
+        clicked = page.evaluate(
+            """() => {
+                const isVisible = (node) => {
+                    if (!node) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    const box = node.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && box.width > 0
+                        && box.height > 0;
+                };
+                const popup = [...document.querySelectorAll('[id^="timeman_edit_popup_"]')]
+                    .find((node) => isVisible(node));
+                if (!popup) {
+                    return { ok: false, error: 'No encontre el popup de edicion.' };
+                }
+                const buttons = [...popup.querySelectorAll('button, [role="button"]')].filter(isVisible);
+                const button = buttons.find((node) => /^(guardar|finalizar)$/i.test((node.textContent || '').trim()))
+                    || buttons.find((node) => (node.className || '').includes('popup-window-button-create'));
+                if (!button) {
+                    return { ok: false, error: `Botones visibles: ${buttons.map((node) => (node.textContent || '').trim()).join(', ')}` };
+                }
+                button.scrollIntoView({ block: 'center', inline: 'center' });
+                for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    button.dispatchEvent(new MouseEvent(eventName, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }));
+                }
+                return { ok: true, label: (button.textContent || '').trim() };
+            }"""
+        )
+        if not clicked or not clicked.get("ok"):
+            error = clicked.get("error") if isinstance(clicked, dict) else "respuesta vacia"
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No pude pulsar Guardar/Finalizar en el dia de trabajo: {error}")
+        for _ in range(20):
+            page.wait_for_timeout(250)
+            if not self._workday_editor_is_open(page):
+                return
         self._save_debug_artifacts(page)
-        raise BitrixBrowserError("No pude pulsar Finalizar en el dia de trabajo.")
+        raise BitrixBrowserError("Bitrix no cerro la edicion del dia de trabajo despues de guardar.")
 
     def _open_worktime_page(self, page) -> None:
         candidates = [
