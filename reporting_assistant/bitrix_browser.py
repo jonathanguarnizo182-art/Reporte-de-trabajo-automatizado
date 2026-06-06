@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 from .config import CONFIG_DIR
@@ -12,6 +13,15 @@ from .models import BitrixTaskTarget, BitrixTimeEntry, TimeSegment
 
 class BitrixBrowserError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class ExistingTimeEntry:
+    id: str
+    target_date: date
+    start: str
+    seconds: int
+    text: str
 
 
 class BitrixBrowserAutomation:
@@ -58,7 +68,11 @@ class BitrixBrowserAutomation:
                 progress_callback,
                 f"Seguimiento {index}/{total} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}",
             )
-            self._add_time_entry(page, entry)
+            action = self._sync_time_entry(page, entry)
+            self._progress(
+                progress_callback,
+                f"Seguimiento {index}/{total} {action} - {entry.target_date.strftime('%d/%m/%Y')} {entry.start}",
+            )
 
         self._close_time_tracking_modal(page)
         workday_entries = [
@@ -103,7 +117,7 @@ class BitrixBrowserAutomation:
         for index, entry in enumerate(entries, start=1):
             if progress_callback is not None:
                 progress_callback(index, total, entry)
-            self._add_time_entry(page, entry)
+            self._sync_time_entry(page, entry)
 
     def _progress(self, callback: Callable[[str], None] | None, message: str) -> None:
         if callback is not None:
@@ -721,6 +735,9 @@ class BitrixBrowserAutomation:
     def _link_worktime_day_to_task(self, page, entry: BitrixTimeEntry, task_url: str) -> None:
         date_label = entry.target_date.strftime("%d/%m/%Y")
         self._open_worktime_day_details(page, entry)
+        if self._worktime_detail_contains_task_url(page, task_url):
+            self._close_worktime_detail(page)
+            return
         try:
             editor = page.locator("textarea:visible, [contenteditable='true']:visible").last
             if editor.evaluate("el => el.tagName.toLowerCase()") == "textarea":
@@ -732,6 +749,7 @@ class BitrixBrowserAutomation:
             send = page.locator("button:visible, [role='button']:visible").filter(has_text=re.compile("ENVIAR", re.IGNORECASE))
             send.first.click()
             page.wait_for_timeout(1200)
+            self._close_worktime_detail(page)
         except Exception as exc:
             self._save_debug_artifacts(page)
             raise BitrixBrowserError(f"No pude vincular la jornada {date_label} con la tarea: {exc}") from exc
@@ -748,17 +766,472 @@ class BitrixBrowserAutomation:
         ]
         for pattern in duration_patterns:
             try:
-                target = page.get_by_text(pattern, exact=False).first
-                if target.is_visible(timeout=1200):
+                candidates = page.get_by_text(pattern, exact=False)
+                for index in range(candidates.count()):
+                    target = candidates.nth(index)
+                    if not target.is_visible(timeout=500):
+                        continue
                     target.click()
                     page.wait_for_timeout(1200)
-                    return
+                    if self._worktime_detail_matches_entry(page, entry):
+                        return
+                    self._close_worktime_detail(page)
             except Exception:
                 continue
         self._save_debug_artifacts(page)
         raise BitrixBrowserError(
-            f"No pude abrir el detalle de Tiempo de trabajo para {entry.target_date.strftime('%d/%m/%Y')}."
+            f"No pude abrir un detalle de Tiempo de trabajo que coincida con "
+            f"{entry.target_date.strftime('%d/%m/%Y')} {entry.start}-{entry.end}."
         )
+
+    def _worktime_detail_matches_entry(self, page, entry: BitrixTimeEntry) -> bool:
+        try:
+            text = self._normalize_text(page.locator("body").inner_text(timeout=1500))
+        except Exception:
+            return False
+        if entry.start not in text or entry.end not in text:
+            return False
+        day_no_zero = f"{entry.target_date.day}/{entry.target_date.month:02d}/{entry.target_date.year}"
+        date_tokens = [
+            entry.target_date.strftime("%d/%m/%Y"),
+            entry.target_date.strftime("%d.%m.%Y"),
+            day_no_zero,
+        ]
+        return any(token and token in text for token in date_tokens) or bool(re.search(r"\bTotal\b", text))
+
+    def _worktime_detail_contains_task_url(self, page, task_url: str) -> bool:
+        try:
+            text = page.locator("body").inner_text(timeout=1500)
+        except Exception:
+            return False
+        canonical = task_url.rstrip("/")
+        return canonical in text or f"{canonical}/" in text
+
+    def _close_worktime_detail(self, page) -> None:
+        selectors = [
+            "[aria-label*='Cerrar']:visible",
+            "[title*='Cerrar']:visible",
+            ".popup-window-close-icon:visible",
+            ".ui-sidepanel-close:visible",
+        ]
+        for selector in selectors:
+            try:
+                buttons = page.locator(selector)
+                for index in range(buttons.count()):
+                    button = buttons.nth(index)
+                    if button.is_visible(timeout=250):
+                        button.click()
+                        page.wait_for_timeout(700)
+                        return
+            except Exception:
+                continue
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    def _sync_time_entry(self, page, entry: BitrixTimeEntry) -> str:
+        existing_entries = self._list_existing_time_entries(page)
+        same_date = [item for item in existing_entries if item.target_date == entry.target_date]
+        date_label = entry.target_date.strftime("%d/%m/%Y")
+        if len(same_date) > 1:
+            raise BitrixBrowserError(
+                f"Bitrix tiene {len(same_date)} registros de Seguimiento del tiempo para {date_label}. "
+                "No debe existir mas de un registro con la misma fecha para este proyecto. "
+                "Corrija esos duplicados en Bitrix y vuelva a ejecutar."
+            )
+        if not same_date:
+            self._add_time_entry(page, entry)
+            return "creado"
+        existing = same_date[0]
+        if self._existing_time_entry_matches(existing, entry):
+            return "omitido"
+        self._update_time_entry(page, existing, entry)
+        return "actualizado"
+
+    def _list_existing_time_entries(self, page) -> list[ExistingTimeEntry]:
+        internal_items = self._list_existing_time_entries_internal(page)
+        if internal_items is not None:
+            return internal_items
+        try:
+            modal_context = self._ensure_time_tracking_modal(page)
+        except BitrixBrowserError as exc:
+            raise BitrixBrowserError(
+                "No pude leer los registros actuales de Seguimiento del tiempo. "
+                "Para evitar duplicados no se escribio nada."
+            ) from exc
+        modal_items = self._list_existing_time_entries_from_modal(modal_context)
+        if modal_items is not None:
+            return modal_items
+        self._save_debug_artifacts(page)
+        raise BitrixBrowserError(
+            "Bitrix no expuso los registros actuales de Seguimiento del tiempo. "
+            "Para evitar duplicados no se escribio nada."
+        )
+
+    def _list_existing_time_entries_internal(self, page) -> list[ExistingTimeEntry] | None:
+        task_id = self._task_id_from_url(page.url)
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(
+                    """async (taskId) => {
+                        const runtime = window.BX?.Runtime || window.top?.BX?.Runtime;
+                        const tryLoad = async (name) => {
+                            try {
+                                if (runtime?.loadExtension) {
+                                    await runtime.loadExtension(name);
+                                }
+                            } catch (_) {}
+                        };
+                        await tryLoad('tasks.v2.application.task-card');
+                        await tryLoad('tasks.v2.provider.service.time-tracking-service');
+                        await tryLoad('tasks.v2.component.fields.time-tracking');
+                        const bxCandidates = [window.BX, window.top?.BX].filter(Boolean);
+                        const normalize = (item) => ({
+                            id: String(item?.id ?? item?.ID ?? item?.elapsedId ?? ''),
+                            taskId: Number(item?.taskId ?? item?.TASK_ID ?? item?.task_id ?? taskId),
+                            createdAtTs: Number(item?.createdAtTs ?? item?.CREATED_DATE_TS ?? item?.createdAt ?? 0),
+                            seconds: Number(item?.seconds ?? item?.SECONDS ?? item?.duration ?? 0),
+                            text: String(item?.text ?? item?.TEXT ?? item?.comment ?? item?.COMMENT_TEXT ?? ''),
+                        });
+                        for (const bx of bxCandidates) {
+                            const service = bx?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
+                            if (service?.list) {
+                                const listed = await service.list(Number(taskId), { reset: true });
+                                const source = Array.isArray(listed)
+                                    ? listed
+                                    : Array.isArray(listed?.items)
+                                        ? listed.items
+                                        : Array.isArray(listed?.elapsedTimes)
+                                            ? listed.elapsedTimes
+                                            : [];
+                                if (source.length > 0) {
+                                    return { ok: true, items: source.map(normalize), source: 'service' };
+                                }
+                            }
+                            const store = bx?.Tasks?.V2?.Core?.getStore?.();
+                            const model = bx?.Tasks?.V2?.Const?.Model?.ElapsedTimes;
+                            const getters = store?.getters || {};
+                            const candidates = [];
+                            if (model) {
+                                for (const name of ['getByTaskId', 'getListByTaskId', 'getAll', 'getList']) {
+                                    const getter = getters[`${model}/${name}`];
+                                    if (typeof getter === 'function') {
+                                        try {
+                                            candidates.push(getter(Number(taskId)));
+                                        } catch (_) {
+                                            try {
+                                                candidates.push(getter(String(taskId)));
+                                            } catch (__) {}
+                                        }
+                                    }
+                                }
+                            }
+                            for (const candidate of candidates) {
+                                const source = Array.isArray(candidate)
+                                    ? candidate
+                                    : Array.isArray(candidate?.items)
+                                        ? candidate.items
+                                        : candidate && typeof candidate === 'object'
+                                            ? Object.values(candidate)
+                                            : [];
+                                const filtered = source
+                                    .map(normalize)
+                                    .filter((item) => !item.taskId || item.taskId === Number(taskId));
+                                if (filtered.length > 0) {
+                                    return { ok: true, items: filtered, source: 'store' };
+                                }
+                            }
+                        }
+                        return { ok: false, reason: 'no-internal-source' };
+                    }""",
+                    task_id,
+                )
+            except Exception:
+                continue
+            if isinstance(result, dict) and result.get("ok"):
+                return [item for item in (self._parse_existing_time_entry(raw) for raw in result.get("items", [])) if item]
+        return None
+
+    def _list_existing_time_entries_from_modal(self, context) -> list[ExistingTimeEntry] | None:
+        try:
+            rows = context.evaluate(
+                """() => {
+                    const rowNodes = [...document.querySelectorAll('.tasks-time-tracking-list-item')]
+                        .filter((node) => !node.querySelector('.tasks-time-tracking-list-item-edit'));
+                    if (rowNodes.length === 0) {
+                        return [];
+                    }
+                    const output = [];
+                    for (const row of rowNodes) {
+                        const text = (row.innerText || row.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const dateMatch = text.match(/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\s+\\d{1,2}:\\d{2}\\b/);
+                        const durationMatch = text.match(/\\b\\d{1,3}:\\d{2}:\\d{2}\\b/);
+                        const commentNode = row.querySelector(
+                            '.tasks-time-tracking-list-item-view-text, [class*="comment"], [class*="description"]'
+                        );
+                        const comment = (commentNode?.innerText || commentNode?.textContent || '').trim();
+                        if (dateMatch && durationMatch) {
+                            output.push({
+                                id: row.getAttribute('data-id') || row.dataset?.id || '',
+                                visibleDate: dateMatch[0],
+                                durationText: durationMatch[0],
+                                text: comment || text,
+                            });
+                        }
+                    }
+                    return output;
+                }"""
+            )
+        except Exception:
+            return None
+        output = []
+        for raw in rows or []:
+            parsed = self._parse_existing_time_entry(raw)
+            if parsed is not None:
+                output.append(parsed)
+        return output
+
+    def _parse_existing_time_entry(self, raw: dict) -> ExistingTimeEntry | None:
+        if not isinstance(raw, dict):
+            return None
+        parsed_date, parsed_start = self._parse_existing_date_time(raw)
+        if parsed_date is None:
+            return None
+        seconds = self._parse_existing_seconds(raw)
+        return ExistingTimeEntry(
+            id=str(raw.get("id") or ""),
+            target_date=parsed_date,
+            start=parsed_start,
+            seconds=seconds,
+            text=str(raw.get("text") or ""),
+        )
+
+    def _parse_existing_date_time(self, raw: dict) -> tuple[date | None, str]:
+        visible = str(raw.get("visibleDate") or "")
+        match = re.search(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{1,2}):(\d{2})", visible)
+        if match:
+            day, month, year, hour, minute = match.groups()
+            return date(int(year), int(month), int(day)), f"{int(hour):02d}:{int(minute):02d}"
+        timestamp = raw.get("createdAtTs")
+        try:
+            if timestamp:
+                parsed = datetime.fromtimestamp(int(timestamp))
+                return parsed.date(), f"{parsed.hour:02d}:{parsed.minute:02d}"
+        except Exception:
+            return None, ""
+        return None, ""
+
+    def _parse_existing_seconds(self, raw: dict) -> int:
+        value = raw.get("seconds")
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+        duration_text = str(raw.get("durationText") or "")
+        match = re.search(r"(\d{1,3}):(\d{2}):(\d{2})", duration_text)
+        if match:
+            hours, minutes, seconds = (int(part) for part in match.groups())
+            return hours * 3600 + minutes * 60 + seconds
+        return 0
+
+    def _existing_time_entry_matches(self, existing: ExistingTimeEntry, entry: BitrixTimeEntry) -> bool:
+        return (
+            existing.target_date == entry.target_date
+            and existing.start == entry.start
+            and existing.seconds == self._entry_seconds(entry)
+            and self._normalize_text(existing.text) == self._normalize_text(entry.comment)
+        )
+
+    def _entry_seconds(self, entry: BitrixTimeEntry) -> int:
+        return entry.hours * 3600 + entry.minutes * 60
+
+    def _normalize_text(self, value: str) -> str:
+        return " ".join((value or "").split()).strip()
+
+    def _update_time_entry(self, page, existing: ExistingTimeEntry, entry: BitrixTimeEntry) -> None:
+        service_error = None
+        if existing.id:
+            try:
+                saved_id = self._update_time_entry_via_bitrix_service(page, existing, entry)
+                self._wait_until_entry_saved(page, entry, saved_id)
+                self._confirm_synced_time_entry(page, entry)
+                return
+            except BitrixBrowserError as exc:
+                service_error = exc
+        try:
+            modal_context = self._ensure_time_tracking_modal(page)
+            self._open_existing_time_entry_editor(page, modal_context, existing, entry)
+            saved_id = self._save_entry_via_vue_form(page, modal_context, entry)
+            self._wait_until_entry_saved(page, entry, saved_id, context=modal_context)
+            self._confirm_synced_time_entry(page, entry)
+            return
+        except BitrixBrowserError as exc:
+            self._save_debug_artifacts(page)
+            detail = f" Error interno: {service_error}" if service_error else ""
+            raise BitrixBrowserError(
+                f"No pude actualizar el Seguimiento del tiempo de {entry.target_date.strftime('%d/%m/%Y')}.{detail}"
+            ) from exc
+
+    def _update_time_entry_via_bitrix_service(
+        self,
+        page,
+        existing: ExistingTimeEntry,
+        entry: BitrixTimeEntry,
+    ) -> str:
+        task_id = self._task_id_from_url(page.url)
+        hours, minutes = self._parse_start_time(entry.start)
+        payload = {
+            "id": existing.id,
+            "year": entry.target_date.year,
+            "month": entry.target_date.month,
+            "day": entry.target_date.day,
+            "hour": hours,
+            "minute": minutes,
+            "seconds": self._entry_seconds(entry),
+            "text": entry.comment,
+        }
+        errors = []
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(
+                    """async ({ taskId, entry }) => {
+                        const runtime = window.BX?.Runtime || window.top?.BX?.Runtime;
+                        const tryLoad = async (name) => {
+                            try {
+                                if (runtime?.loadExtension) {
+                                    await runtime.loadExtension(name);
+                                }
+                            } catch (_) {}
+                        };
+                        await tryLoad('tasks.v2.application.task-card');
+                        await tryLoad('tasks.v2.provider.service.time-tracking-service');
+                        await tryLoad('tasks.v2.component.fields.time-tracking');
+                        const bxCandidates = [window.BX, window.top?.BX].filter(Boolean);
+                        const text = bxCandidates.map((bx) => bx?.Text).find(Boolean);
+                        const timezone = bxCandidates.map((bx) => bx?.Main?.timezone).find(Boolean);
+                        const endpoint = bxCandidates
+                            .map((bx) => bx?.Tasks?.V2?.Const?.Endpoint?.TaskTimeTrackingUpdate)
+                            .find(Boolean);
+                        const apiClient = bxCandidates
+                            .map((bx) => bx?.Tasks?.V2?.Lib?.apiClient)
+                            .find(Boolean);
+                        const localTarget = new Date(
+                            entry.year,
+                            entry.month - 1,
+                            entry.day,
+                            entry.hour,
+                            entry.minute,
+                            0,
+                            0,
+                        );
+                        let createdAtMs = localTarget.getTime();
+                        if (timezone?.getOffset) {
+                            createdAtMs = localTarget.getTime() - timezone.getOffset(localTarget.getTime());
+                            createdAtMs = localTarget.getTime() - timezone.getOffset(createdAtMs);
+                        }
+                        const item = {
+                            id: entry.id,
+                            taskId,
+                            createdAtTs: Math.floor(createdAtMs / 1000),
+                            seconds: entry.seconds,
+                            text: entry.text,
+                            source: 'manual',
+                            rights: { edit: true, remove: true },
+                        };
+                        for (const bx of bxCandidates) {
+                            const service = bx?.Tasks?.V2?.Provider?.Service?.timeTrackingService;
+                            if (service?.update) {
+                                const attempts = [
+                                    () => service.update(taskId, item),
+                                    () => service.update(taskId, entry.id, item),
+                                    () => service.update(item),
+                                ];
+                                for (const attempt of attempts) {
+                                    try {
+                                        const updated = await attempt();
+                                        if (service.list) {
+                                            await service.list(taskId, { reset: true });
+                                        }
+                                        return { ok: true, id: String(updated?.id || item.id) };
+                                    } catch (_) {}
+                                }
+                            }
+                        }
+                        if (apiClient && endpoint) {
+                            const updated = await apiClient.post(endpoint, {
+                                task: {
+                                    id: taskId,
+                                    elapsedTime: {
+                                        id: item.id,
+                                        taskId: item.taskId,
+                                        seconds: item.seconds,
+                                        source: item.source,
+                                        text: item.text,
+                                        createdAtTs: item.createdAtTs,
+                                        rights: item.rights,
+                                    },
+                                },
+                            });
+                            return { ok: true, id: String(updated?.id || item.id) };
+                        }
+                        return { ok: false, error: 'Bitrix no expuso metodo interno para actualizar seguimiento.' };
+                    }""",
+                    {"taskId": task_id, "entry": payload},
+                )
+            except Exception as exc:
+                errors.append(f"{frame.url}: {exc}")
+                continue
+            if result and result.get("ok"):
+                return str(result.get("id") or existing.id)
+            error = result.get("error") if isinstance(result, dict) else "respuesta vacia"
+            errors.append(f"{frame.url}: {error}")
+        self._save_debug_artifacts(page)
+        detail = " | ".join(errors[-5:]) if errors else "no hubo frames disponibles"
+        raise BitrixBrowserError(f"Bitrix no acepto actualizar la entrada por API interna: {detail}")
+
+    def _open_existing_time_entry_editor(self, page, context, existing: ExistingTimeEntry, entry: BitrixTimeEntry) -> None:
+        date_label = entry.target_date.strftime("%d/%m/%Y")
+        opened = context.evaluate(
+            """(dateLabel) => {
+                const rows = [...document.querySelectorAll('.tasks-time-tracking-list-item')]
+                    .filter((node) => !node.querySelector('.tasks-time-tracking-list-item-edit'));
+                const row = rows.find((node) => (node.innerText || node.textContent || '').includes(dateLabel));
+                if (!row) {
+                    return false;
+                }
+                const button = row.querySelector(
+                    '[class*="--edit"], [class*="edit"], [title*="Editar"], [aria-label*="Editar"], button'
+                );
+                const target = button || row;
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    target.dispatchEvent(new MouseEvent(eventName, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }));
+                }
+                return true;
+            }""",
+            date_label,
+        )
+        if not opened:
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(f"No encontre el registro existente de {date_label} para editarlo.")
+        self._wait_for_entry_form(page, context)
+
+    def _confirm_synced_time_entry(self, page, entry: BitrixTimeEntry) -> None:
+        existing_entries = self._list_existing_time_entries(page)
+        same_date = [item for item in existing_entries if item.target_date == entry.target_date]
+        if len(same_date) != 1 or not self._existing_time_entry_matches(same_date[0], entry):
+            self._save_debug_artifacts(page)
+            raise BitrixBrowserError(
+                f"No pude confirmar que Seguimiento del tiempo quedara sincronizado para "
+                f"{entry.target_date.strftime('%d/%m/%Y')}."
+            )
 
     def _clock_duration(self, start: str, end: str) -> tuple[int, int] | None:
         try:
